@@ -4,11 +4,14 @@ import { CONTRACTS, EXPLORER, TOKENS, tenantSchema } from '@lpmon/shared';
 import { sql } from '../db.js';
 import { client, isSameAddr } from '../chain/client.js';
 import { modifyLiquidityEvent, v4StateViewAbi, v4PositionManagerAbi, POOL_KEY_ABI } from '../chain/abi.js';
-import { tokenMeta } from '../chain/tokens.js';
+import { tokenMeta, type TokenMeta } from '../chain/tokens.js';
 import { sqrtPriceX96ToSqrtPrice, priceFromSqrt } from '../chain/math.js';
 import { ethUsd, usdPerToken } from '../chain/prices.js';
 import { poolStats } from '../chain/volume.js';
 import { v3Liquidity, v4Liquidity } from '../chain/positions.js';
+
+type LiqEvent = { tx_hash: string; block_number: bigint | string; timestamp: number | string; liquidity_delta: bigint | string };
+type Episode = LiqEvent[];
 
 // Kolom jsonb bisa tiba sebagai string (tergantung mode query driver) — parse defensif
 function parseData(v: unknown): any {
@@ -19,11 +22,29 @@ function parseData(v: unknown): any {
   return v;
 }
 
+// Satu NFT bisa dipakai untuk beberapa "episode" posisi (tutup penuh lalu isi
+// lagi). Episode = rangkaian event sampai liquidity kumulatif kembali 0.
+function segmentEpisodes(events: LiqEvent[]): { episodes: Episode[]; open: Episode | null } {
+  const episodes: Episode[] = [];
+  let current: Episode = [];
+  let cum = 0n;
+  for (const e of events) {
+    current.push(e);
+    cum += BigInt(e.liquidity_delta);
+    if (cum === 0n) {
+      episodes.push(current);
+      current = [];
+    }
+  }
+  return { episodes, open: current.length ? current : null };
+}
+
 // Melacak modal awal per posisi di schema milik address (position_track),
-// menghitung P&L, dan memindahkan posisi yang ditutup ke tabel journal.
+// menghitung P&L, memindahkan posisi tertutup ke journal, dan memulihkan
+// episode yang terlewat (buka-tutup saat monitor tidak memantau) dari indeks.
 @Injectable()
 export class TrackingService {
-  // Aliran token dari/ke wallet dalam satu tx (untuk nilai deposit asli)
+  // Aliran token dari/ke wallet dalam satu tx (untuk nilai deposit/penarikan asli)
   private async walletFlows(txHash: string, wallet: string): Promise<Map<string, number>> {
     const flows = new Map<string, number>();
     const res = await fetch(`${EXPLORER}/api/v2/transactions/${txHash}/token-transfers?type=ERC-20`, {
@@ -45,9 +66,15 @@ export class TrackingService {
     return flows;
   }
 
-  // Fallback saat indeks belum mencakup bloknya: cari event liquidity langsung
-  // di chain, terfilter poolId (cepat), jendela ~1,5 hari terakhir
-  private async chainLiquidityEvents(poolId: string, salt: `0x${string}`, sign: 'add' | 'remove') {
+  // Semua event liquidity sebuah tokenId: dari indeks Ponder, fallback getLogs
+  // langsung (jendela ~1,5 hari) saat indeks belum mencakup bloknya
+  private async saltEvents(poolId: string | null, tokenId: bigint): Promise<LiqEvent[]> {
+    const salt = pad(toHex(tokenId), { size: 32 });
+    const rows: LiqEvent[] = await sql`
+      SELECT tx_hash, block_number, timestamp, liquidity_delta
+      FROM ponder.liquidity_event WHERE salt = ${salt} ORDER BY block_number` as any;
+    if (rows.length > 0 || !poolId) return rows;
+
     const head = await client.getBlockNumber();
     const CHUNK = 150_000n;
     const start = head > 600_000n ? head - 600_000n : 0n;
@@ -63,134 +90,179 @@ export class TrackingService {
         }));
       } catch { /* potongan gagal, lanjut */ }
     }
-    const mine = logs.filter((l) =>
-      l.args.salt === salt && (sign === 'add' ? l.args.liquidityDelta > 0n : l.args.liquidityDelta < 0n));
+    const mine = logs.filter((l) => l.args.salt === salt);
     return Promise.all(mine.map(async (l) => ({
       tx_hash: l.transactionHash,
       block_number: l.blockNumber,
       timestamp: Number((await client.getBlock({ blockNumber: l.blockNumber })).timestamp),
+      liquidity_delta: l.args.liquidityDelta,
     })));
   }
 
-  // Rekonstruksi penutupan dari tx tarik-liquidity asli: nilai penarikan (termasuk
-  // fee) dinilai pada harga pool di blok penutupan. Jauh lebih akurat daripada
-  // snapshot terakhir kalau monitor sempat tidak memantau saat posisi ditutup.
-  private async reconstructClose(key: string, wallet: string) {
-    if (!key.startsWith('v4-')) return null;
+  // Metadata pool sebuah tokenId v4 (masih terbaca walau posisi sudah kosong,
+  // selama NFT belum di-burn)
+  private async poolMeta(tokenId: bigint): Promise<{ poolId: string; meta0: TokenMeta; meta1: TokenMeta } | null> {
     try {
-      const tokenId = BigInt(key.split('-')[1]);
       const [poolKey] = await client.readContract({
         address: CONTRACTS.v4PositionManager as `0x${string}`, abi: v4PositionManagerAbi,
         functionName: 'getPoolAndPositionInfo', args: [tokenId],
       });
-      if (/^0x0+$/.test(poolKey.currency0) && /^0x0+$/.test(poolKey.currency1)) return null; // NFT di-burn
+      if (/^0x0+$/.test(poolKey.currency0) && /^0x0+$/.test(poolKey.currency1)) return null;
       const [meta0, meta1] = await Promise.all([tokenMeta(poolKey.currency0), tokenMeta(poolKey.currency1)]);
-      const poolId = keccak256(encodeAbiParameters(POOL_KEY_ABI, [poolKey]));
-      const salt = pad(toHex(tokenId), { size: 32 });
-
-      let removes: { tx_hash: string; block_number: bigint | string; timestamp: number }[] = await sql`
-        SELECT tx_hash, block_number, timestamp FROM ponder.liquidity_event
-        WHERE salt = ${salt} AND liquidity_delta < 0 ORDER BY block_number` as any;
-      if (removes.length === 0) removes = await this.chainLiquidityEvents(poolId, salt, 'remove');
-      if (removes.length === 0) return null;
-
-      const pos = { pool: poolId, meta0, meta1 };
-      let finalUsd = 0;
-      let memeUsd = 0;
-      let anchorUsd = 0;
-      let estimated = false;
-      for (const rm of removes) {
-        const hist = await this.usdAtBlock(pos, BigInt(rm.block_number));
-        if (!hist) { estimated = true; }
-        const flows = await this.walletFlows(rm.tx_hash, wallet);
-        for (const [addr, amt] of flows) {
-          let price: number | null = null;
-          if (isSameAddr(addr, TOKENS.USDG)) price = 1;
-          else if (isSameAddr(addr, meta0.address)) price = hist?.usd0 ?? null;
-          else if (isSameAddr(addr, meta1.address)) price = hist?.usd1 ?? null;
-          else continue;
-          if (price == null) { estimated = true; continue; }
-          const v = Math.abs(amt) * price;
-          finalUsd += v;
-          const anchorTok = isSameAddr(addr, TOKENS.USDG) || isSameAddr(addr, TOKENS.WETH);
-          if (anchorTok) anchorUsd += v; else memeUsd += v;
-        }
-      }
-      if (!(finalUsd > 0)) return null;
-      const share = memeUsd + anchorUsd > 0 ? memeUsd / (memeUsd + anchorUsd) : 0;
-      return {
-        finalUsd,
-        closeTs: Number(removes[removes.length - 1].timestamp) * 1000,
-        closeSide: share > 0.95 ? 'below' : share < 0.05 ? 'above' : 'in',
-        estimated,
-      };
+      return { poolId: keccak256(encodeAbiParameters(POOL_KEY_ABI, [poolKey])), meta0, meta1 };
     } catch {
       return null;
     }
   }
 
-  // Harga USD kedua token pool pada blok tertentu (archive call).
-  // null kalau RPC tidak melayani state historis.
-  private async usdAtBlock(pos: any, blockNumber: bigint) {
+  // Harga USD kedua token pool pada blok tertentu (archive call)
+  private async usdAtBlock(poolId: string, meta0: TokenMeta, meta1: TokenMeta, blockNumber: bigint) {
     try {
       const slot0 = await client.readContract({
         address: CONTRACTS.v4StateView as `0x${string}`, abi: v4StateViewAbi,
-        functionName: 'getSlot0', args: [pos.pool], blockNumber,
+        functionName: 'getSlot0', args: [poolId as `0x${string}`], blockNumber,
       });
-      const price = priceFromSqrt(
-        sqrtPriceX96ToSqrtPrice(slot0[0]), pos.meta0.decimals, pos.meta1.decimals,
-      );
-      const eth = await ethUsd(); // anchor ETH memakai harga sekarang (ditandai estimasi)
-      const { usd0, usd1 } = usdPerToken({ meta0: pos.meta0, meta1: pos.meta1, priceT1PerT0: price, eth });
+      const price = priceFromSqrt(sqrtPriceX96ToSqrtPrice(slot0[0]), meta0.decimals, meta1.decimals);
+      const eth = await ethUsd();
+      const { usd0, usd1 } = usdPerToken({ meta0, meta1, priceT1PerT0: price, eth });
       if (usd0 == null || usd1 == null) return null;
       const usesEthAnchor =
-        pos.meta0.native || pos.meta1.native ||
-        isSameAddr(pos.meta0.address, TOKENS.WETH) || isSameAddr(pos.meta1.address, TOKENS.WETH);
+        meta0.native || meta1.native ||
+        isSameAddr(meta0.address, TOKENS.WETH) || isSameAddr(meta1.address, TOKENS.WETH);
       return { usd0, usd1, estimated: usesEthAnchor };
     } catch {
       return null;
     }
   }
 
-  // Modal awal posisi v4: event tambah-liquidity (indeks Ponder, fallback chain) -> tx -> aliran token
+  // Nilai USD aliran token milik wallet untuk sekumpulan event (adds ATAU removes),
+  // dinilai pada harga pool di blok masing-masing event
+  private async valueEvents(
+    events: LiqEvent[], poolId: string, meta0: TokenMeta, meta1: TokenMeta, wallet: string,
+  ) {
+    let usd = 0;
+    let memeUsd = 0;
+    let anchorUsd = 0;
+    let estimated = false;
+    for (const ev of events) {
+      const hist = await this.usdAtBlock(poolId, meta0, meta1, BigInt(ev.block_number));
+      if (!hist) estimated = true;
+      else if (hist.estimated) estimated = true;
+      const flows = await this.walletFlows(ev.tx_hash, wallet);
+      for (const [addr, amt] of flows) {
+        let price: number | null = null;
+        if (isSameAddr(addr, TOKENS.USDG)) price = 1;
+        else if (isSameAddr(addr, meta0.address)) price = hist?.usd0 ?? null;
+        else if (isSameAddr(addr, meta1.address)) price = hist?.usd1 ?? null;
+        else continue;
+        if (price == null) { estimated = true; continue; }
+        const v = Math.abs(amt) * price;
+        usd += v;
+        const anchorTok = isSameAddr(addr, TOKENS.USDG) || isSameAddr(addr, TOKENS.WETH) ||
+          (meta0.native && isSameAddr(addr, meta0.address)) || (meta1.native && isSameAddr(addr, meta1.address));
+        if (anchorTok) anchorUsd += v; else memeUsd += v;
+      }
+    }
+    const share = memeUsd + anchorUsd > 0 ? memeUsd / (memeUsd + anchorUsd) : 0;
+    return { usd, memeShare: share, estimated };
+  }
+
+  // Modal awal posisi v4 AKTIF: adds milik episode berjalan (bukan episode lama NFT yang dipakai ulang)
   private async reconstructEntry(pos: any, wallet: string): Promise<{ initialUsd: number; openTs: number; source: string } | null> {
     if (pos.version !== 'v4') return null;
     try {
-      const salt = pad(toHex(BigInt(pos.tokenId)), { size: 32 });
-      let adds: { tx_hash: string; block_number: bigint | string; timestamp: number }[] = await sql`
-        SELECT tx_hash, block_number, timestamp FROM ponder.liquidity_event
-        WHERE salt = ${salt} AND liquidity_delta > 0 ORDER BY block_number` as any;
-      if (adds.length === 0) adds = await this.chainLiquidityEvents(pos.pool, salt, 'add');
+      const events = await this.saltEvents(pos.pool, BigInt(pos.tokenId));
+      const { open } = segmentEpisodes(events);
+      if (!open) return null;
+      const adds = open.filter((e) => BigInt(e.liquidity_delta) > 0n);
       if (adds.length === 0) return null;
-
-      let initialUsd = 0;
-      let estimated = false;
-      for (const add of adds) {
-        // Nilai token pada harga pool di blok deposit — bukan harga sekarang
-        const hist = await this.usdAtBlock(pos, BigInt(add.block_number));
-        const usd0 = hist?.usd0 ?? pos.usd0;
-        const usd1 = hist?.usd1 ?? pos.usd1;
-        if (!hist) estimated = true;
-        else if (hist.estimated) estimated = true;
-
-        const flows = await this.walletFlows(add.tx_hash, wallet);
-        for (const [addr, amt] of flows) {
-          let price: number | null = null;
-          if (isSameAddr(addr, TOKENS.USDG)) price = 1;
-          else if (isSameAddr(addr, pos.meta0.address)) price = usd0;
-          else if (isSameAddr(addr, pos.meta1.address)) price = usd1;
-          else continue;
-          initialUsd += Math.abs(amt) * (price ?? 0);
-        }
-      }
-      if (!(initialUsd > 0)) return null;
+      const { usd, estimated } = await this.valueEvents(adds, pos.pool, pos.meta0, pos.meta1, wallet);
+      if (!(usd > 0)) return null;
       return {
-        initialUsd,
+        initialUsd: usd,
         openTs: Number(adds[0].timestamp) * 1000,
         source: estimated ? 'index-estimasi' : 'index',
       };
     } catch {
       return null;
+    }
+  }
+
+  // Rekonstruksi penuh satu episode TERTUTUP -> entri journal
+  private async reconstructEpisode(
+    tokenId: bigint, episode: Episode, poolId: string, meta0: TokenMeta, meta1: TokenMeta, wallet: string,
+  ) {
+    const adds = episode.filter((e) => BigInt(e.liquidity_delta) > 0n);
+    const removes = episode.filter((e) => BigInt(e.liquidity_delta) < 0n);
+    if (adds.length === 0 || removes.length === 0) return null;
+    const entry = await this.valueEvents(adds, poolId, meta0, meta1, wallet);
+    const exit = await this.valueEvents(removes, poolId, meta0, meta1, wallet);
+    if (!(entry.usd > 0) || !(exit.usd > 0)) return null;
+    const flip = isSameAddr(meta0.address, TOKENS.USDG) ||
+      ((meta0.native || isSameAddr(meta0.address, TOKENS.WETH)) && !isSameAddr(meta1.address, TOKENS.USDG));
+    const base = flip ? meta1.symbol : meta0.symbol;
+    const quote = flip ? meta0.symbol : meta1.symbol;
+    return {
+      key: `v4-${tokenId}`,
+      pair: `${base}/${quote}`,
+      openTs: Number(adds[0].timestamp) * 1000,
+      closeTs: Number(removes[removes.length - 1].timestamp) * 1000,
+      initialUsd: entry.usd,
+      finalUsd: exit.usd,
+      pnlUsd: exit.usd - entry.usd,
+      closeSide: exit.memeShare > 0.95 ? 'below' : exit.memeShare < 0.05 ? 'above' : 'in',
+      estimated: entry.estimated || exit.estimated,
+    };
+  }
+
+  // Pemulihan: episode tertutup yang belum ada di journal (mis. buka-tutup saat
+  // monitor tidak memantau) direkonstruksi dari indeks. Jalan hanya saat indeks
+  // sudah dekat ujung chain.
+  private async recoverMissedEpisodes(address: string, schema: string, activeKeys: string[]) {
+    const [{ synced }] = await sql`
+      SELECT COALESCE(MAX(block_number), 0)::bigint AS synced FROM ponder.liquidity_event`;
+    const head = await client.getBlockNumber();
+    if (head - BigInt(synced) > 5_000n) return;
+
+    const owned = await sql`
+      SELECT token_id FROM (
+        SELECT DISTINCT ON (version, token_id) version, token_id, "to"
+        FROM ponder.position_transfer
+        ORDER BY version, token_id, block_number DESC, id DESC
+      ) latest
+      WHERE version = 'v4' AND lower(latest."to") = ${address.toLowerCase()}`;
+
+    for (const { token_id } of owned as any[]) {
+      const tokenId = BigInt(token_id);
+      const key = `v4-${tokenId}`;
+      const events = await this.saltEvents(null, tokenId);
+      const { episodes } = segmentEpisodes(events);
+      if (episodes.length === 0) continue;
+      let meta: Awaited<ReturnType<typeof this.poolMeta>> = null;
+      for (const ep of episodes) {
+        const closeTs = Number(ep[ep.length - 1].timestamp) * 1000;
+        const [exists] = await sql.unsafe(
+          `SELECT 1 FROM "${schema}".journal
+           WHERE key = $1 AND ABS(EXTRACT(EPOCH FROM close_ts) - $2) < 180`,
+          [key, closeTs / 1000],
+        );
+        if (exists) continue;
+        // posisi aktif dengan episode lama yang belum dijurnal tetap dipulihkan;
+        // episode berjalan tidak tersentuh karena hanya episode TERTUTUP di sini
+        meta ??= await this.poolMeta(tokenId);
+        if (!meta) break;
+        const rec = await this.reconstructEpisode(tokenId, ep, meta.poolId, meta.meta0, meta.meta1, address);
+        if (!rec) continue;
+        await sql.unsafe(
+          `INSERT INTO "${schema}".journal
+             (key, pair, version, open_ts, close_ts, initial_usd, final_usd, fees_usd, pnl_usd, pnl_pct, close_side, source, estimated)
+           VALUES ($1,$2,'v4',$3,$4,$5,$6,NULL,$7,$8,$9,'rekonstruksi',$10)
+           ON CONFLICT (key, close_ts) DO NOTHING`,
+          [rec.key, rec.pair, new Date(rec.openTs), new Date(rec.closeTs), rec.initialUsd, rec.finalUsd,
+            rec.pnlUsd, rec.initialUsd > 0 ? (rec.pnlUsd / rec.initialUsd) * 100 : null,
+            rec.closeSide, rec.estimated],
+        );
+      }
     }
   }
 
@@ -205,8 +277,7 @@ export class TrackingService {
     for (const pos of positions) {
       let track: any = byKey.get(pos.key);
 
-      // Self-healing: modal "first-seen" atau "estimasi" di-upgrade ke nilai
-      // eksak (harga blok pembukaan) begitu datanya bisa direkonstruksi
+      // Self-healing: modal "first-seen"/"estimasi" di-upgrade ke nilai eksak
       const upgradable = track &&
         (track.initial_source === 'first-seen' || track.initial_source?.endsWith('-estimasi'));
       if (upgradable) {
@@ -268,10 +339,8 @@ export class TrackingService {
       );
     }
 
-    // Posisi yang dulu terlacak tapi kini hilang = kandidat ditutup.
-    // ANTI-FLAPPING: sebelum dicatat tutup, verifikasi on-chain bahwa
-    // liquidity-nya benar-benar 0 — gangguan RPC/Blockscout sesaat tidak boleh
-    // menghasilkan entri jurnal palsu (bug yang terjadi di v1).
+    // Posisi terlacak yang hilang = kandidat ditutup.
+    // ANTI-FLAPPING: verifikasi on-chain liquidity = 0 sebelum dijurnal.
     for (const t of tracks) {
       if (activeKeys.includes(t.key) || !t.data?.pair) continue;
       try {
@@ -279,24 +348,37 @@ export class TrackingService {
         const liq = t.key.startsWith('v4-')
           ? await v4Liquidity(tokenId)
           : await v3Liquidity(tokenId);
-        if (liq > 0n) continue; // masih hidup — jangan dijurnal, coba lagi poll berikutnya
+        if (liq > 0n) continue;
       } catch {
-        continue; // tidak bisa diverifikasi — tunda, jangan ambil kesimpulan
+        continue; // tidak bisa diverifikasi — tunda
       }
       const d = t.data;
-      // Utamakan rekonstruksi dari tx penutupan asli (nilai penarikan riil,
-      // termasuk fee); fallback ke snapshot terakhir kalau tidak tersedia
-      const rec = await this.reconstructClose(t.key, address);
-      const initial = Number(t.initial_usd);
+      // Nilai penutupan dari tx tarik-liquidity asli; fallback snapshot terakhir
+      let rec: any = null;
+      if (t.key.startsWith('v4-')) {
+        const tokenId = BigInt(t.key.split('-')[1]);
+        const meta = await this.poolMeta(tokenId);
+        if (meta) {
+          const events = await this.saltEvents(meta.poolId, tokenId);
+          const { episodes } = segmentEpisodes(events);
+          if (episodes.length > 0) {
+            rec = await this.reconstructEpisode(
+              tokenId, episodes[episodes.length - 1], meta.poolId, meta.meta0, meta.meta1, address,
+            );
+          }
+        }
+      }
+      const initial = rec?.initialUsd ?? Number(t.initial_usd);
       const finalUsd = rec?.finalUsd ?? d.valueUsd;
       const feesUsd = rec ? null : (d.feesUsd ?? 0) + (d.collectedFeesUsd ?? 0);
-      const pnlUsd = rec ? rec.finalUsd - initial : d.pnlUsd;
+      const pnlUsd = rec ? rec.pnlUsd : d.pnlUsd;
       await sql.unsafe(
         `INSERT INTO "${schema}".journal
            (key, pair, version, open_ts, close_ts, initial_usd, final_usd, fees_usd, pnl_usd, pnl_pct, close_side, source, estimated)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
          ON CONFLICT (key, close_ts) DO NOTHING`,
-        [t.key, d.pair, d.version, t.open_ts,
+        [t.key, d.pair, d.version,
+          rec ? new Date(rec.openTs) : t.open_ts,
           rec ? new Date(rec.closeTs) : new Date(),
           initial, finalUsd, feesUsd, pnlUsd,
           initial > 0 ? (pnlUsd / initial) * 100 : null,
@@ -306,6 +388,10 @@ export class TrackingService {
       );
       await sql.unsafe(`DELETE FROM "${schema}".position_track WHERE key = $1`, [t.key]);
     }
+
+    // Episode yang terjadi di luar pengawasan monitor
+    await this.recoverMissedEpisodes(address, schema, activeKeys).catch((err) =>
+      console.warn('[tracking] pemulihan episode gagal:', err.message));
   }
 
   async journal(address: string) {
