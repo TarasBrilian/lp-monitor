@@ -56,7 +56,9 @@ export class PositionsService {
     let url = `${EXPLORER}/api/v2/addresses/${address}/nft?type=ERC-721`;
     for (let page = 0; page < 10 && url; page++) {
       const res = await fetch(url, { headers: { accept: 'application/json' }, signal: AbortSignal.timeout(15_000) });
-      if (!res.ok) break;
+      // Kegagalan harus jadi error, bukan hasil kosong — hasil kosong palsu
+      // akan membuat semua posisi dianggap "ditutup"
+      if (!res.ok) throw new Error(`Blockscout ${res.status} saat discovery`);
       const json: any = await res.json();
       for (const item of json.items ?? []) {
         const addr = (item?.token?.address_hash ?? item?.token?.address)?.toLowerCase();
@@ -78,7 +80,15 @@ export class PositionsService {
     if (cached && Date.now() - cached.ts < LIST_CACHE_MS) return cached.data;
 
     const eth = await ethUsd();
-    const ids = await this.discover(address);
+    let ids: Discovered;
+    try {
+      ids = await this.discover(address);
+    } catch (err: any) {
+      // Discovery gagal total: kembalikan snapshot lama (basi) daripada
+      // menyimpulkan portofolio kosong
+      if (cached) return { ...(cached.data as any), stale: true, error: err.message };
+      throw err;
+    }
 
     // Saring posisi kosong dengan pembacaan ringan (digabung Multicall3).
     // NFT yang sudah ketahuan kosong tidak dicek ulang selama 6 jam.

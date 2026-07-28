@@ -25,6 +25,13 @@ export async function v4Liquidity(tokenId: bigint): Promise<bigint> {
   });
 }
 
+export async function v3Liquidity(tokenId: bigint): Promise<bigint> {
+  const pos = await client.readContract({
+    address: NFPM, abi: v3PositionManagerAbi, functionName: 'positions', args: [tokenId],
+  });
+  return pos[7];
+}
+
 export async function readV4Position(tokenId: bigint, eth: number | null): Promise<RawPosition> {
   const [[poolKey, packedInfo], liquidity] = await Promise.all([
     client.readContract({ address: POSM, abi: v4PositionManagerAbi, functionName: 'getPoolAndPositionInfo', args: [tokenId] }),

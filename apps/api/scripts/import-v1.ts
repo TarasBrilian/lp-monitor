@@ -38,7 +38,7 @@ for (const r of rows) {
        (key, pair, version, open_ts, close_ts, initial_usd, final_usd, fees_usd,
         pnl_usd, pnl_pct, close_side, source, estimated)
      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
-     ON CONFLICT (key) DO NOTHING`,
+     ON CONFLICT (key, close_ts) DO NOTHING`,
     [r.key, r.pair, r.version ?? 'v4',
       r.openTs ? new Date(r.openTs) : null,
       r.closeTs ? new Date(r.closeTs) : null,

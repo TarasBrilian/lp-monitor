@@ -360,8 +360,10 @@ function History({ session, onAuthFail }: { session: Session; onAuthFail: () => 
                 <td>{badge(r.close_side)}</td>
                 <td className="num">{fmtUsd(num(r.initial_usd))}</td>
                 <td className="num">{r.fees_usd != null ? fmtUsd(num(r.fees_usd)) : <span className="muted" title="Fee sudah termasuk di nilai penarikan">—</span>}</td>
-                <td className={`num ${num(r.pnl_usd)! >= 0 ? 'pos-t' : 'neg-t'}`}>{r.estimated ? '≈' : ''}{fmtUsd(num(r.pnl_usd), true)}</td>
-                <td className={`num ${num(r.pnl_usd)! >= 0 ? 'pos-t' : 'neg-t'}`}>{r.pnl_pct != null ? `${num(r.pnl_pct)! >= 0 ? '+' : ''}${num(r.pnl_pct)!.toFixed(1)}%` : '—'}</td>
+                <td className={`num ${Math.abs(num(r.pnl_usd)!) < 0.005 ? 'muted' : num(r.pnl_usd)! >= 0 ? 'pos-t' : 'neg-t'}`}>
+                  {Math.abs(num(r.pnl_usd)!) < 0.005 ? '$0.00' : `${r.estimated ? '≈' : ''}${fmtUsd(num(r.pnl_usd), true)}`}</td>
+                <td className={`num ${Math.abs(num(r.pnl_usd)!) < 0.005 ? 'muted' : num(r.pnl_usd)! >= 0 ? 'pos-t' : 'neg-t'}`}>
+                  {r.pnl_pct == null ? '—' : Math.abs(num(r.pnl_usd)!) < 0.005 ? '0.0%' : `${num(r.pnl_pct)! >= 0 ? '+' : ''}${num(r.pnl_pct)!.toFixed(1)}%`}</td>
               </tr>
             ))}
           </tbody>

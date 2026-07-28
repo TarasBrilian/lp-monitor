@@ -7,6 +7,7 @@ import { modifyLiquidityEvent, v4StateViewAbi } from '../chain/abi.js';
 import { sqrtPriceX96ToSqrtPrice, priceFromSqrt } from '../chain/math.js';
 import { ethUsd, usdPerToken } from '../chain/prices.js';
 import { poolStats } from '../chain/volume.js';
+import { v3Liquidity, v4Liquidity } from '../chain/positions.js';
 
 // Melacak modal awal per posisi di schema milik address (position_track),
 // menghitung P&L, dan memindahkan posisi yang ditutup ke tabel journal.
@@ -198,15 +199,27 @@ export class TrackingService {
       );
     }
 
-    // Posisi yang dulu terlacak tapi kini hilang = ditutup -> pindah ke journal
+    // Posisi yang dulu terlacak tapi kini hilang = kandidat ditutup.
+    // ANTI-FLAPPING: sebelum dicatat tutup, verifikasi on-chain bahwa
+    // liquidity-nya benar-benar 0 — gangguan RPC/Blockscout sesaat tidak boleh
+    // menghasilkan entri jurnal palsu (bug yang terjadi di v1).
     for (const t of tracks) {
       if (activeKeys.includes(t.key) || !t.data?.pair) continue;
+      try {
+        const tokenId = BigInt(t.key.split('-')[1]);
+        const liq = t.key.startsWith('v4-')
+          ? await v4Liquidity(tokenId)
+          : await v3Liquidity(tokenId);
+        if (liq > 0n) continue; // masih hidup — jangan dijurnal, coba lagi poll berikutnya
+      } catch {
+        continue; // tidak bisa diverifikasi — tunda, jangan ambil kesimpulan
+      }
       const d = t.data;
       await sql.unsafe(
         `INSERT INTO "${schema}".journal
            (key, pair, version, open_ts, close_ts, initial_usd, final_usd, fees_usd, pnl_usd, pnl_pct, close_side, source)
          VALUES ($1, $2, $3, $4, now(), $5, $6, $7, $8, $9, $10, 'live')
-         ON CONFLICT (key) DO NOTHING`,
+         ON CONFLICT (key, close_ts) DO NOTHING`,
         [t.key, d.pair, d.version, t.open_ts, t.initial_usd, d.valueUsd,
           (d.feesUsd ?? 0) + (d.collectedFeesUsd ?? 0), d.pnlUsd,
           t.initial_usd > 0 ? (d.pnlUsd / t.initial_usd) * 100 : null, d.closeSide],

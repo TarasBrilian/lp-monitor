@@ -11,7 +11,8 @@ export class TenantService {
     await sql.unsafe(`CREATE SCHEMA IF NOT EXISTS "${schema}"`);
     await sql.unsafe(`
       CREATE TABLE IF NOT EXISTS "${schema}".journal (
-        key         text PRIMARY KEY,
+        id          bigserial PRIMARY KEY,
+        key         text NOT NULL,
         pair        text NOT NULL,
         version     text NOT NULL,
         open_ts     timestamptz,
@@ -26,6 +27,25 @@ export class TenantService {
         estimated   boolean NOT NULL DEFAULT false,
         created_at  timestamptz NOT NULL DEFAULT now()
       )`);
+    // Satu NFT bisa dipakai ulang (tutup lalu isi liquidity lagi) = beberapa
+    // episode per key — karena itu PK bukan di key, tapi unik per (key, close_ts).
+    // Migrasi idempoten untuk schema yang dibuat sebelum aturan ini:
+    await sql.unsafe(`
+      DO $$ BEGIN
+        IF EXISTS (SELECT 1 FROM information_schema.table_constraints
+                   WHERE table_schema = '${schema}' AND table_name = 'journal'
+                     AND constraint_name = 'journal_pkey'
+                     AND constraint_type = 'PRIMARY KEY')
+           AND NOT EXISTS (SELECT 1 FROM information_schema.columns
+                   WHERE table_schema = '${schema}' AND table_name = 'journal'
+                     AND column_name = 'id') THEN
+          ALTER TABLE "${schema}".journal DROP CONSTRAINT journal_pkey;
+          ALTER TABLE "${schema}".journal ADD COLUMN id bigserial PRIMARY KEY;
+        END IF;
+      END $$`);
+    await sql.unsafe(`
+      CREATE UNIQUE INDEX IF NOT EXISTS journal_key_close_ts
+      ON "${schema}".journal (key, close_ts)`);
     await sql.unsafe(`
       CREATE TABLE IF NOT EXISTS "${schema}".position_track (
         key            text PRIMARY KEY,
