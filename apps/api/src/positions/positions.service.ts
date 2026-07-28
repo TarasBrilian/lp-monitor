@@ -23,11 +23,15 @@ export class PositionsService {
         SELECT COALESCE(MAX(block_number), 0)::bigint AS synced FROM ponder.position_transfer`;
       const head = await client.getBlockNumber();
       if (head - BigInt(synced) < 2_000n) {
-        const rows = await sql`
-          SELECT DISTINCT ON (version, token_id) version, token_id, "to"
-          FROM ponder.position_transfer
-          ORDER BY version, token_id, block_number DESC`;
-        const mine = rows.filter((r: any) => r.to.toLowerCase() === address.toLowerCase());
+        // Pemilik terakhir tiap NFT; tie-break pakai id supaya deterministik
+        // saat ada >1 transfer dalam blok yang sama
+        const mine = await sql`
+          SELECT version, token_id FROM (
+            SELECT DISTINCT ON (version, token_id) version, token_id, "to"
+            FROM ponder.position_transfer
+            ORDER BY version, token_id, block_number DESC, id DESC
+          ) latest
+          WHERE lower(latest."to") = ${address.toLowerCase()}`;
         return {
           v3: mine.filter((r: any) => r.version === 'v3').map((r: any) => BigInt(r.token_id)),
           v4: mine.filter((r: any) => r.version === 'v4').map((r: any) => BigInt(r.token_id)),

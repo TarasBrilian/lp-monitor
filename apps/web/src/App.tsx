@@ -8,15 +8,53 @@ declare global {
 type Session = { token: string; address: string; schema: string };
 
 const api = (path: string, init?: RequestInit) => fetch(`/api${path}`, init);
+const EXPLORER = 'https://robinhoodchain.blockscout.com';
 
+// ---------- format (identik dengan v1) ----------
+function fmtUsd(v: number | null | undefined, sign = false) {
+  if (v == null || !Number.isFinite(v)) return '—';
+  const s = sign && v > 0 ? '+' : v < 0 ? '-' : '';
+  const abs = Math.abs(v);
+  const d = abs > 0 && abs < 1 ? 4 : 2;
+  return `${s}$${abs.toLocaleString('en-US', { minimumFractionDigits: d, maximumFractionDigits: d })}`;
+}
+
+function fmtPrice(p: number) {
+  if (!(p > 0) || !Number.isFinite(p)) return '—';
+  if (p >= 1e30) return '∞';
+  if (p < 1e-30) return '≈0';
+  if (p >= 1000) return p.toLocaleString('en-US', { maximumFractionDigits: 2 });
+  if (p >= 0.0001) return Number(p.toPrecision(5)).toString();
+  const e = Math.floor(Math.log10(p));
+  const digits = Math.round(p * Math.pow(10, -e + 3)).toString().slice(0, 4);
+  return `0.0{${-e - 1}}${digits}`;
+}
+
+function fmtAmt(v: number) {
+  if (!Number.isFinite(v)) return '—';
+  if (v >= 1e9) return (v / 1e9).toFixed(2) + 'B';
+  if (v >= 1e6) return (v / 1e6).toFixed(2) + 'M';
+  if (v >= 1e3) return (v / 1e3).toFixed(1) + 'K';
+  if (v >= 1) return v.toFixed(2);
+  return v > 0 ? Number(v.toPrecision(4)).toString() : '0';
+}
+
+// ---------- app ----------
 export function App() {
   const [session, setSession] = useState<Session | null>(() => {
+    // sesi via hash (untuk debugging): #token=...&address=...
+    const h = new URLSearchParams(location.hash.slice(1));
+    if (h.get('token') && h.get('address')) {
+      const s = { token: h.get('token')!, address: h.get('address')!, schema: '' };
+      localStorage.setItem('lpmon-session', JSON.stringify(s));
+      history.replaceState(null, '', location.pathname);
+      return s;
+    }
     const raw = localStorage.getItem('lpmon-session');
     return raw ? JSON.parse(raw) : null;
   });
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [me, setMe] = useState<any>(null);
 
   async function login() {
     setBusy(true);
@@ -26,7 +64,6 @@ export function App() {
       const wallet = createWalletClient({ transport: custom(window.ethereum) });
       const [addr] = await wallet.requestAddresses();
       const address = getAddress(addr);
-
       const { nonce } = await (await api('/auth/nonce')).json();
       const { message } = await (await api('/auth/message', {
         method: 'POST', headers: { 'content-type': 'application/json' },
@@ -51,114 +88,196 @@ export function App() {
   function logout() {
     localStorage.removeItem('lpmon-session');
     setSession(null);
-    setMe(null);
   }
 
-  useEffect(() => {
-    if (!session) return;
-    api('/me', { headers: { authorization: `Bearer ${session.token}` } })
-      .then(async (r) => (r.ok ? setMe(await r.json()) : logout()))
-      .catch(() => {});
-  }, [session]);
-
   return (
-    <main className="wrap">
-      <h1>💧 LP Monitor <span className="v2">v2</span></h1>
-      <p className="sub">Robinhood Chain · Uniswap v3 &amp; v4 · multi-user</p>
-
-      {!session ? (
-        <section className="card">
-          <h2>Masuk dengan wallet</h2>
-          <p>
-            Tanda tangani satu pesan untuk membuktikan kepemilikan address-mu.
-            Tanpa transaksi, tanpa gas, tanpa akses dana.
-          </p>
-          <button onClick={login} disabled={busy}>
-            {busy ? 'Menunggu tanda tangan…' : 'Connect wallet & Sign-In'}
-          </button>
-          {error && <p className="error">{error}</p>}
-        </section>
-      ) : (
-        <>
-          <section className="card">
-            <h2>Terhubung ✓</h2>
-            <p><b>Address:</b> <code>{session.address}</code></p>
-            <p><b>Schema data:</b> <code>{me?.schema ?? '…'}</code></p>
-            <button onClick={logout} className="ghost">Keluar</button>
+    <>
+      <header className="topbar">
+        <div>
+          <h1>💧 LP Monitor <span className="v2">v2</span></h1>
+          <div className="sub">Robinhood Chain · Uniswap v3 &amp; v4 · multi-user</div>
+        </div>
+        {session && (
+          <div className="topbar-right">
+            <span className="chip">{session.address.slice(0, 6)}…{session.address.slice(-4)}</span>
+            <button className="ghost" onClick={logout}>Keluar</button>
+          </div>
+        )}
+      </header>
+      <main>
+        {!session ? (
+          <section className="card setup">
+            <h2>Masuk dengan wallet</h2>
+            <p>Tanda tangani satu pesan untuk membuktikan kepemilikan address-mu. Tanpa transaksi, tanpa gas, tanpa akses dana.</p>
+            <button onClick={login} disabled={busy}>{busy ? 'Menunggu tanda tangan…' : 'Connect wallet & Sign-In'}</button>
+            {error && <p className="error">{error}</p>}
           </section>
-          <Positions token={session.token} />
-        </>
-      )}
-    </main>
+        ) : (
+          <Dashboard session={session} onAuthFail={logout} />
+        )}
+      </main>
+      <footer>
+        Data: indeks Ponder + RPC resmi Robinhood Chain + Blockscout + GeckoTerminal (semua gratis).
+        P&amp;L lengkap &amp; jurnal menyusul di M3.
+      </footer>
+    </>
   );
 }
 
-function fmtUsd(v: number | null | undefined) {
-  if (v == null || !Number.isFinite(v)) return '—';
-  const abs = Math.abs(v);
-  const d = abs > 0 && abs < 1 ? 4 : 2;
-  return `$${abs.toLocaleString('en-US', { minimumFractionDigits: d, maximumFractionDigits: d })}`;
-}
-
-function fmtPrice(p: number) {
-  if (!(p > 0)) return '—';
-  if (p >= 1e30) return '∞';
-  if (p < 1e-30) return '≈0';
-  if (p >= 1000) return p.toLocaleString('en-US', { maximumFractionDigits: 2 });
-  if (p >= 0.0001) return Number(p.toPrecision(5)).toString();
-  const e = Math.floor(Math.log10(p));
-  const digits = Math.round(p * Math.pow(10, -e + 3)).toString().slice(0, 4);
-  return `0.0{${-e - 1}}${digits}`;
-}
-
-function Positions({ token }: { token: string }) {
+function useAuthed(path: string, token: string, refreshMs: number, onAuthFail: () => void) {
   const [data, setData] = useState<any>(null);
   const [err, setErr] = useState<string | null>(null);
-
   useEffect(() => {
     let stop = false;
     const load = () =>
-      api('/positions', { headers: { authorization: `Bearer ${token}` } })
+      api(path, { headers: { authorization: `Bearer ${token}` } })
         .then(async (r) => {
+          if (r.status === 401) return onAuthFail();
           if (!r.ok) throw new Error(`HTTP ${r.status}`);
           if (!stop) { setData(await r.json()); setErr(null); }
         })
         .catch((e) => !stop && setErr(e.message));
     load();
-    const t = setInterval(load, 60_000);
+    const t = setInterval(load, refreshMs);
     return () => { stop = true; clearInterval(t); };
-  }, [token]);
+  }, [path, token]);
+  return { data, err };
+}
 
-  if (err) return <section className="card"><p className="error">Gagal memuat posisi: {err}</p></section>;
-  if (!data) return <section className="card"><p className="muted">Memuat posisi… (bisa ~1 menit saat indeks masih backfill)</p></section>;
+function Dashboard({ session, onAuthFail }: { session: Session; onAuthFail: () => void }) {
+  const { data: pos, err: posErr } = useAuthed('/positions', session.token, 60_000, onAuthFail);
+  const { data: bal } = useAuthed('/balances', session.token, 120_000, onAuthFail);
+  const [tab, setTab] = useState<'saldo' | 'history'>('saldo');
+
+  const totalAset = (bal?.totalUsd ?? 0) + (pos?.totalValueUsd ?? 0) + (pos?.totalFeesUsd ?? 0);
 
   return (
-    <section className="card">
-      <h2>Posisi aktif ({data.positions.length})</h2>
-      <p className="muted">
-        Total nilai {fmtUsd(data.totalValueUsd)} · fee {fmtUsd(data.totalFeesUsd)} ·
-        ETH {fmtUsd(data.ethUsd)} · sumber: {data.discovery}
-      </p>
-      {data.positions.length === 0 && (
-        <p className="muted">Tidak ada posisi LP aktif. Buka posisi di Uniswap, refresh dalam ~1 menit.</p>
+    <>
+      <section className="tiles">
+        <div className="tile"><div className="label">Total aset</div>
+          <div className="value">{fmtUsd(totalAset)}</div>
+          <div className="hint">saldo wallet + posisi LP + fee</div></div>
+        <div className="tile"><div className="label">Saldo wallet</div>
+          <div className="value">{fmtUsd(bal?.totalUsd)}</div>
+          <div className="hint">di luar posisi LP</div></div>
+        <div className="tile"><div className="label">Nilai posisi LP</div>
+          <div className="value">{fmtUsd(pos?.totalValueUsd)}</div></div>
+        <div className="tile"><div className="label">Fee belum diklaim</div>
+          <div className="value">{fmtUsd(pos?.totalFeesUsd)}</div></div>
+        <div className="tile"><div className="label">Posisi aktif</div>
+          <div className="value">{pos?.positions?.length ?? '…'}</div>
+          <div className="hint">deteksi: {pos?.discovery ?? '…'} · ETH {fmtUsd(pos?.ethUsd)}</div></div>
+      </section>
+
+      <div className="tabs">
+        <button className={`tab ${tab === 'saldo' ? 'active' : ''}`} onClick={() => setTab('saldo')}>Saldo wallet</button>
+        <button className={`tab ${tab === 'history' ? 'active' : ''}`} onClick={() => setTab('history')}>History</button>
+      </div>
+      {tab === 'saldo' ? <Balances bal={bal} /> : (
+        <p className="muted">Jurnal &amp; history on-chain menyusul di M3 — struktur datanya sudah siap di schema address-mu.</p>
       )}
-      {data.positions.map((p: any) => (
-        <div key={p.key} className="pos">
-          <div className="pos-head">
-            <b>{p.pair}</b> <span className="badge">{p.version}</span>{' '}
-            <span className={p.inRange ? 'ok' : 'bad'}>
-              {p.inRange ? '● dalam range' : p.outSide === 'below' ? '✕ tembus bawah' : '▲ di atas range'}
-            </span>
+
+      <h2>Posisi aktif</h2>
+      {posErr && <p className="error">Gagal memuat posisi: {posErr} — dicoba lagi otomatis.</p>}
+      {!pos && !posErr && <p className="muted">Memuat posisi… (bisa ~1 menit saat indeks masih mengejar)</p>}
+      {pos?.positions?.length === 0 && (
+        <p className="muted">Tidak ada posisi LP aktif. Buka posisi di Uniswap, muncul otomatis maksimal 1 menit.</p>
+      )}
+      {pos?.positions?.map((p: any) => <PositionCard key={p.key} p={p} />)}
+    </>
+  );
+}
+
+function PositionCard({ p }: { p: any }) {
+  const d = p.disp;
+  const logPct = (() => {
+    if (!(d.upper > d.lower) || !(d.price > 0) || !(d.lower > 0)) return null;
+    const lo = Math.log(d.lower), hi = Math.log(d.upper);
+    return Math.max(0, Math.min(1, (Math.log(d.price) - lo) / (hi - lo))) * 100;
+  })();
+  const distNote = p.inRange
+    ? <>jarak ke batas bawah: <b>{(((d.price - d.lower) / d.price) * 100).toFixed(1)}%</b></>
+    : p.outSide === 'below'
+      ? <>harga <b>{(((d.lower - d.price) / d.lower) * 100).toFixed(1)}% di bawah</b> batas range</>
+      : <>harga <b>{(((d.price - d.upper) / d.upper) * 100).toFixed(1)}% di atas</b> batas range</>;
+
+  return (
+    <article className="card position">
+      <div className="pos-head">
+        <span className="pair">{p.pair}</span>
+        <span className="badge">{p.version}</span>
+        <span className="badge">fee {(p.feeTier / 10000).toLocaleString('en-US', { maximumFractionDigits: 2 })}%</span>
+        {p.inRange
+          ? <span className="status in">● DALAM RANGE</span>
+          : p.outSide === 'below'
+            ? <span className="status out-below">✕ TEMBUS BAWAH — 100% {d.base}</span>
+            : <span className="status out-above">▲ DI ATAS RANGE — 100% {d.quote}</span>}
+      </div>
+
+      {logPct != null && (
+        <div className="range">
+          <div className="range-bar">
+            <div className="range-fill" />
+            <div className={`range-marker ${p.inRange ? '' : 'out'}`} style={{ left: `${logPct}%` }} />
           </div>
-          <div className="muted">
-            {fmtPrice(p.disp.lower)} — <b>{fmtPrice(p.disp.price)}</b> — {fmtPrice(p.disp.upper)} {p.disp.quote}
+          <div className="range-labels">
+            <span>min {fmtPrice(d.lower)}</span>
+            <span className="cur">{fmtPrice(d.price)} {d.quote}</span>
+            <span>max {fmtPrice(d.upper)}</span>
           </div>
-          <div>
-            nilai <b>{fmtUsd(p.valueUsd)}</b> · fee belum diklaim <b>{fmtUsd(p.feesUsd)}</b> ·{' '}
-            {p.disp.baseAmt.toFixed(2)} {p.disp.base} + {p.disp.quoteAmt.toFixed(2)} {p.disp.quote}
-          </div>
+          <div className="range-note">{distNote}</div>
         </div>
-      ))}
-    </section>
+      )}
+
+      <div className="pos-grid">
+        <div><div className="label">{d.base}</div>
+          <div className="val">{fmtAmt(d.baseAmt)} <span className="sub">≈ {fmtUsd(d.baseAmt * (d.baseUsd ?? 0))}</span></div></div>
+        <div><div className="label">{d.quote}</div>
+          <div className="val">{fmtAmt(d.quoteAmt)} <span className="sub">≈ {fmtUsd(d.quoteAmt * (d.quoteUsd ?? 0))}</span></div></div>
+        <div><div className="label">Fee belum diklaim</div>
+          <div className="val">{fmtUsd(p.feesUsd)}</div>
+          <div className="sub">{fmtAmt(d.baseFees)} {d.base} + {fmtAmt(d.quoteFees)} {d.quote}</div></div>
+        <div><div className="label">Nilai posisi</div><div className="val">{fmtUsd(p.valueUsd)}</div></div>
+      </div>
+
+      <div className="pos-links">
+        <a href={`https://www.geckoterminal.com/robinhood/pools/${p.pool}`} target="_blank" rel="noopener">GeckoTerminal ↗</a>
+        {p.version === 'v3' && <a href={`${EXPLORER}/address/${p.pool}`} target="_blank" rel="noopener">Pool di explorer ↗</a>}
+      </div>
+    </article>
+  );
+}
+
+function Balances({ bal }: { bal: any }) {
+  if (!bal) return <p className="muted">Memuat saldo…</p>;
+  const shown = bal.tokens.filter((t: any) => (t.usd ?? 0) >= 0.01 || (t.usd == null && t.amount > 0));
+  const dust = bal.tokens.length - shown.length;
+  return (
+    <>
+      <div className="table-wrap">
+        <table>
+          <thead>
+            <tr><th>Token</th><th className="num">Jumlah</th><th className="num">Harga</th><th className="num">Nilai</th></tr>
+          </thead>
+          <tbody>
+            {shown.map((t: any, i: number) => (
+              <tr key={t.address ?? `native-${i}`}>
+                <td>
+                  {t.symbol}
+                  {t.verified && <span className="pos-t"> ✓</span>}
+                  {t.native && <span className="badge"> native</span>}
+                  {t.impostor && <span className="badge" style={{ color: 'var(--critical)' }}> palsu?</span>}
+                </td>
+                <td className="num">{fmtAmt(t.amount)}</td>
+                <td className="num">{t.priceUsd != null ? fmtUsd(t.priceUsd) : '—'}</td>
+                <td className="num">{t.usd != null ? fmtUsd(t.usd) : <span className="muted">tidak ada harga</span>}</td>
+              </tr>
+            ))}
+            <tr><td><b>Total</b></td><td /><td /><td className="num"><b>{fmtUsd(bal.totalUsd)}</b></td></tr>
+          </tbody>
+        </table>
+      </div>
+      {dust > 0 && <p className="muted">{dust} token debu (&lt; $0.01) disembunyikan.</p>}
+    </>
   );
 }
