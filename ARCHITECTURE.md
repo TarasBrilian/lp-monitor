@@ -67,15 +67,37 @@ WETH `0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73`.
 
 ## Milestone
 
-1. **M1 — Fondasi** ✅ scaffold monorepo, compose postgres, API auth SIWE +
-   tenant provisioning (CREATE SCHEMA per address), web connect wallet + sign-in.
-2. **M2 — Indexer**: Ponder sync event v4/v3, tabel pool/posisi/liquidity-event;
-   API baca posisi aktif per address dari indeks (gantikan polling v1).
-3. **M3 — Paritas v1**: nilai posisi + fee real-time, saldo wallet, P&L, jurnal
-   otomatis (tulis ke schema address), history (dari indeks — tanpa Blockscout).
-4. **M4 — Alert**: rule engine server-side + Web Push per user.
-5. **M5 — Deploy**: compose produksi (api+web+indexer+postgres), panduan VPS,
-   basic hardening. Matikan v1.
+Status per 28 Jul 2026:
+
+1. **M1 — Fondasi** ✅ SELESAI (teruji E2E)
+   Scaffold monorepo, compose postgres, auth SIWE + tenant provisioning
+   (schema per address otomatis saat login), web connect wallet + sign-in.
+
+2. **M2 — Indexer** ✅ SELESAI (dengan catatan)
+   Ponder 0.17 sync event v4/v3 ke schema `ponder`; API discovery posisi dari
+   indeks dengan fallback otomatis ke Blockscout selama indeks tertinggal.
+   *Catatan: backfill dangkal (START_BLOCK 21,3 jt) karena RPC publik
+   rate-limited — laju sync hanya setara laju chain. Backfill dalam (era
+   posisi lama) menunggu RPC lebih longgar di VPS; tinggal ubah START_BLOCK.*
+
+3. **M3 — Paritas v1** 🔶 SEBAGIAN BESAR SELESAI
+   Sudah: nilai posisi + fee real-time (v3/v4), saldo wallet (+ deteksi token
+   palsu), modal awal akurat (rekonstruksi dari tx pembukaan, dinilai pada
+   harga blok kejadian, self-healing), P&L per posisi + total, jurnal otomatis
+   saat posisi ditutup (schema address), tab History dari jurnal, UI paritas
+   v1 (tiles, kartu posisi, range bar log, pill status).
+   Belum: volume pool 24 jam + baseline entry, statistik History (win rate,
+   rata-rata fee/rugi) + pagination 10/halaman, koreksi manual modal awal,
+   rekonstruksi riwayat lama pra-indeks (40 posisi lama user pertama — sudah
+   ada di data v1).
+
+4. **M4 — Alert** ⬜ BELUM MULAI
+   Rule engine server-side (near-lower, tembus bawah, di atas range, P&L flip,
+   volume kering/spike) + Web Push per user.
+
+5. **M5 — Deploy** ⬜ BELUM MULAI
+   Compose produksi (api+web+indexer+postgres), panduan VPS, hardening
+   (basic auth/rate limit API), lalu pensiunkan v1.
 
 ## Konvensi
 
