@@ -79,17 +79,86 @@ export function App() {
           {error && <p className="error">{error}</p>}
         </section>
       ) : (
-        <section className="card">
-          <h2>Terhubung ✓</h2>
-          <p><b>Address:</b> <code>{session.address}</code></p>
-          <p><b>Schema data:</b> <code>{me?.schema ?? '…'}</code></p>
-          <p className="muted">
-            M1 selesai: auth &amp; provisioning. Dashboard posisi menyusul di M2-M3
-            (lihat ARCHITECTURE.md).
-          </p>
-          <button onClick={logout} className="ghost">Keluar</button>
-        </section>
+        <>
+          <section className="card">
+            <h2>Terhubung ✓</h2>
+            <p><b>Address:</b> <code>{session.address}</code></p>
+            <p><b>Schema data:</b> <code>{me?.schema ?? '…'}</code></p>
+            <button onClick={logout} className="ghost">Keluar</button>
+          </section>
+          <Positions token={session.token} />
+        </>
       )}
     </main>
+  );
+}
+
+function fmtUsd(v: number | null | undefined) {
+  if (v == null || !Number.isFinite(v)) return '—';
+  const abs = Math.abs(v);
+  const d = abs > 0 && abs < 1 ? 4 : 2;
+  return `$${abs.toLocaleString('en-US', { minimumFractionDigits: d, maximumFractionDigits: d })}`;
+}
+
+function fmtPrice(p: number) {
+  if (!(p > 0)) return '—';
+  if (p >= 1e30) return '∞';
+  if (p < 1e-30) return '≈0';
+  if (p >= 1000) return p.toLocaleString('en-US', { maximumFractionDigits: 2 });
+  if (p >= 0.0001) return Number(p.toPrecision(5)).toString();
+  const e = Math.floor(Math.log10(p));
+  const digits = Math.round(p * Math.pow(10, -e + 3)).toString().slice(0, 4);
+  return `0.0{${-e - 1}}${digits}`;
+}
+
+function Positions({ token }: { token: string }) {
+  const [data, setData] = useState<any>(null);
+  const [err, setErr] = useState<string | null>(null);
+
+  useEffect(() => {
+    let stop = false;
+    const load = () =>
+      api('/positions', { headers: { authorization: `Bearer ${token}` } })
+        .then(async (r) => {
+          if (!r.ok) throw new Error(`HTTP ${r.status}`);
+          if (!stop) { setData(await r.json()); setErr(null); }
+        })
+        .catch((e) => !stop && setErr(e.message));
+    load();
+    const t = setInterval(load, 60_000);
+    return () => { stop = true; clearInterval(t); };
+  }, [token]);
+
+  if (err) return <section className="card"><p className="error">Gagal memuat posisi: {err}</p></section>;
+  if (!data) return <section className="card"><p className="muted">Memuat posisi… (bisa ~1 menit saat indeks masih backfill)</p></section>;
+
+  return (
+    <section className="card">
+      <h2>Posisi aktif ({data.positions.length})</h2>
+      <p className="muted">
+        Total nilai {fmtUsd(data.totalValueUsd)} · fee {fmtUsd(data.totalFeesUsd)} ·
+        ETH {fmtUsd(data.ethUsd)} · sumber: {data.discovery}
+      </p>
+      {data.positions.length === 0 && (
+        <p className="muted">Tidak ada posisi LP aktif. Buka posisi di Uniswap, refresh dalam ~1 menit.</p>
+      )}
+      {data.positions.map((p: any) => (
+        <div key={p.key} className="pos">
+          <div className="pos-head">
+            <b>{p.pair}</b> <span className="badge">{p.version}</span>{' '}
+            <span className={p.inRange ? 'ok' : 'bad'}>
+              {p.inRange ? '● dalam range' : p.outSide === 'below' ? '✕ tembus bawah' : '▲ di atas range'}
+            </span>
+          </div>
+          <div className="muted">
+            {fmtPrice(p.disp.lower)} — <b>{fmtPrice(p.disp.price)}</b> — {fmtPrice(p.disp.upper)} {p.disp.quote}
+          </div>
+          <div>
+            nilai <b>{fmtUsd(p.valueUsd)}</b> · fee belum diklaim <b>{fmtUsd(p.feesUsd)}</b> ·{' '}
+            {p.disp.baseAmt.toFixed(2)} {p.disp.base} + {p.disp.quoteAmt.toFixed(2)} {p.disp.quote}
+          </div>
+        </div>
+      ))}
+    </section>
   );
 }

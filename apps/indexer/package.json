@@ -3,12 +3,13 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
-    "dev": "ponder dev",
-    "start": "ponder start",
+    "dev": "ponder dev --schema ponder",
+    "start": "ponder start --schema ponder",
     "codegen": "ponder codegen"
   },
   "dependencies": {
     "@lpmon/shared": "workspace:*",
+    "hono": "^4.12.32",
     "ponder": "latest",
     "viem": "^2.21.0"
   }

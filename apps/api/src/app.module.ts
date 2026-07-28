@@ -5,6 +5,8 @@ import { AuthController } from './auth/auth.controller.js';
 import { AuthService } from './auth/auth.service.js';
 import { AuthGuard } from './auth/auth.guard.js';
 import { TenantService } from './tenant/tenant.service.js';
+import { PositionsController } from './positions/positions.controller.js';
+import { PositionsService } from './positions/positions.service.js';
 import { sql } from './db.js';
 
 @Controller()
@@ -30,7 +32,7 @@ class AppController {
       signOptions: { expiresIn: '7d' },
     }),
   ],
-  controllers: [AppController, AuthController],
-  providers: [AuthService, AuthGuard, TenantService],
+  controllers: [AppController, AuthController, PositionsController],
+  providers: [AuthService, AuthGuard, TenantService, PositionsService],
 })
 export class AppModule {}
