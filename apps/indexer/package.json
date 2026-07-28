@@ -1,0 +1,15 @@
+{
+  "name": "@lpmon/indexer",
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "ponder dev",
+    "start": "ponder start",
+    "codegen": "ponder codegen"
+  },
+  "dependencies": {
+    "@lpmon/shared": "workspace:*",
+    "ponder": "latest",
+    "viem": "^2.21.0"
+  }
+}

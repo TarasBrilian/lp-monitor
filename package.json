@@ -1,0 +1,11 @@
+{
+  "name": "lp-monitor-v2",
+  "private": true,
+  "scripts": {
+    "dev:api": "pnpm --filter @lpmon/api dev",
+    "dev:web": "pnpm --filter @lpmon/web dev",
+    "dev:indexer": "pnpm --filter @lpmon/indexer dev",
+    "db:up": "docker compose up -d postgres",
+    "db:down": "docker compose down"
+  }
+}
