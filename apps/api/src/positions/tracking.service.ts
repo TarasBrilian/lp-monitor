@@ -3,7 +3,9 @@ import { pad, toHex } from 'viem';
 import { CONTRACTS, EXPLORER, TOKENS, tenantSchema } from '@lpmon/shared';
 import { sql } from '../db.js';
 import { client, isSameAddr } from '../chain/client.js';
-import { modifyLiquidityEvent } from '../chain/abi.js';
+import { modifyLiquidityEvent, v4StateViewAbi } from '../chain/abi.js';
+import { sqrtPriceX96ToSqrtPrice, priceFromSqrt } from '../chain/math.js';
+import { ethUsd, usdPerToken } from '../chain/prices.js';
 
 // Melacak modal awal per posisi di schema milik address (position_track),
 // menghitung P&L, dan memindahkan posisi yang ditutup ke tabel journal.
@@ -52,8 +54,32 @@ export class TrackingService {
     const mine = logs.filter((l) => l.args.salt === salt && l.args.liquidityDelta > 0n);
     return Promise.all(mine.map(async (l) => ({
       tx_hash: l.transactionHash,
+      block_number: l.blockNumber,
       timestamp: Number((await client.getBlock({ blockNumber: l.blockNumber })).timestamp),
     })));
+  }
+
+  // Harga USD kedua token pool pada blok tertentu (archive call).
+  // null kalau RPC tidak melayani state historis.
+  private async usdAtBlock(pos: any, blockNumber: bigint) {
+    try {
+      const slot0 = await client.readContract({
+        address: CONTRACTS.v4StateView as `0x${string}`, abi: v4StateViewAbi,
+        functionName: 'getSlot0', args: [pos.pool], blockNumber,
+      });
+      const price = priceFromSqrt(
+        sqrtPriceX96ToSqrtPrice(slot0[0]), pos.meta0.decimals, pos.meta1.decimals,
+      );
+      const eth = await ethUsd(); // anchor ETH memakai harga sekarang (ditandai estimasi)
+      const { usd0, usd1 } = usdPerToken({ meta0: pos.meta0, meta1: pos.meta1, priceT1PerT0: price, eth });
+      if (usd0 == null || usd1 == null) return null;
+      const usesEthAnchor =
+        pos.meta0.native || pos.meta1.native ||
+        isSameAddr(pos.meta0.address, TOKENS.WETH) || isSameAddr(pos.meta1.address, TOKENS.WETH);
+      return { usd0, usd1, estimated: usesEthAnchor };
+    } catch {
+      return null;
+    }
   }
 
   // Modal awal posisi v4: event tambah-liquidity (indeks Ponder, fallback chain) -> tx -> aliran token
@@ -61,8 +87,8 @@ export class TrackingService {
     if (pos.version !== 'v4') return null;
     try {
       const salt = pad(toHex(BigInt(pos.tokenId)), { size: 32 });
-      let adds: { tx_hash: string; timestamp: number }[] = await sql`
-        SELECT tx_hash, timestamp FROM ponder.liquidity_event
+      let adds: { tx_hash: string; block_number: bigint | string; timestamp: number }[] = await sql`
+        SELECT tx_hash, block_number, timestamp FROM ponder.liquidity_event
         WHERE salt = ${salt} AND liquidity_delta > 0 ORDER BY block_number` as any;
       if (adds.length === 0) adds = await this.chainAdds(pos, salt);
       if (adds.length === 0) return null;
@@ -70,12 +96,19 @@ export class TrackingService {
       let initialUsd = 0;
       let estimated = false;
       for (const add of adds) {
+        // Nilai token pada harga pool di blok deposit — bukan harga sekarang
+        const hist = await this.usdAtBlock(pos, BigInt(add.block_number));
+        const usd0 = hist?.usd0 ?? pos.usd0;
+        const usd1 = hist?.usd1 ?? pos.usd1;
+        if (!hist) estimated = true;
+        else if (hist.estimated) estimated = true;
+
         const flows = await this.walletFlows(add.tx_hash, wallet);
         for (const [addr, amt] of flows) {
           let price: number | null = null;
           if (isSameAddr(addr, TOKENS.USDG)) price = 1;
-          else if (isSameAddr(addr, pos.meta0.address)) { price = pos.usd0; estimated = true; }
-          else if (isSameAddr(addr, pos.meta1.address)) { price = pos.usd1; estimated = true; }
+          else if (isSameAddr(addr, pos.meta0.address)) price = usd0;
+          else if (isSameAddr(addr, pos.meta1.address)) price = usd1;
           else continue;
           initialUsd += Math.abs(amt) * (price ?? 0);
         }
@@ -101,11 +134,13 @@ export class TrackingService {
     for (const pos of positions) {
       let track: any = byKey.get(pos.key);
 
-      // Self-healing: modal "first-seen" di-upgrade ke data on-chain begitu
-      // event pembukaannya terindeks Ponder
-      if (track && track.initial_source === 'first-seen') {
+      // Self-healing: modal "first-seen" atau "estimasi" di-upgrade ke nilai
+      // eksak (harga blok pembukaan) begitu datanya bisa direkonstruksi
+      const upgradable = track &&
+        (track.initial_source === 'first-seen' || track.initial_source?.endsWith('-estimasi'));
+      if (upgradable) {
         const entry = await this.reconstructEntry(pos, address);
-        if (entry) {
+        if (entry && (entry.source === 'index' || track.initial_source === 'first-seen')) {
           track.initial_usd = entry.initialUsd;
           track.initial_source = entry.source;
           track.open_ts = new Date(entry.openTs);
