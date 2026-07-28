@@ -8,6 +8,7 @@ import { TenantService } from './tenant/tenant.service.js';
 import { PositionsController } from './positions/positions.controller.js';
 import { PositionsService } from './positions/positions.service.js';
 import { BalancesService } from './positions/balances.service.js';
+import { TrackingService } from './positions/tracking.service.js';
 import { sql } from './db.js';
 
 @Controller()
@@ -34,6 +35,6 @@ class AppController {
     }),
   ],
   controllers: [AppController, AuthController, PositionsController],
-  providers: [AuthService, AuthGuard, TenantService, PositionsService, BalancesService],
+  providers: [AuthService, AuthGuard, TenantService, PositionsService, BalancesService, TrackingService],
 })
 export class AppModule {}

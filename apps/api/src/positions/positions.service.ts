@@ -4,6 +4,7 @@ import { sql } from '../db.js';
 import { client } from '../chain/client.js';
 import { ethUsd } from '../chain/prices.js';
 import { readV3Position, readV4Position, v4Liquidity, displayFields } from '../chain/positions.js';
+import { TrackingService } from './tracking.service.js';
 
 type Discovered = { v3: bigint[]; v4: bigint[]; source: 'index' | 'blockscout' };
 
@@ -12,6 +13,8 @@ const LIST_CACHE_MS = 30_000;
 
 @Injectable()
 export class PositionsService {
+  constructor(private tracking: TrackingService) {}
+
   private knownEmpty = new Map<string, number>(); // key posisi -> ts terakhir dicek kosong
   private listCache = new Map<string, { ts: number; data: unknown }>();
 
@@ -108,12 +111,17 @@ export class PositionsService {
     }
     positions.sort((a, b) => b.valueUsd - a.valueUsd);
 
+    // Modal awal, P&L, umur, dan jurnal penutupan (schema milik address)
+    await this.tracking.enrich(address, positions).catch((err) =>
+      console.warn('[tracking] gagal:', err.message));
+
     const data = {
       address,
       ethUsd: eth,
       discovery: ids.source,
       totalValueUsd: positions.reduce((s, p) => s + p.valueUsd, 0),
-      totalFeesUsd: positions.reduce((s, p) => s + p.feesUsd, 0),
+      totalFeesUsd: positions.reduce((s, p) => s + p.feesUsd + (p.collectedFeesUsd ?? 0), 0),
+      totalPnlUsd: positions.reduce((s, p) => s + (p.pnlUsd ?? 0), 0),
       positions,
       updatedAt: Date.now(),
     };

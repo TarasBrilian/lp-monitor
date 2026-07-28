@@ -30,6 +30,19 @@ function fmtPrice(p: number) {
   return `0.0{${-e - 1}}${digits}`;
 }
 
+function fmtDur(ms: number | null | undefined) {
+  if (ms == null || !Number.isFinite(ms)) return '—';
+  const m = Math.floor(ms / 60000);
+  if (m < 60) return `${m}m`;
+  const h = Math.floor(m / 60);
+  if (h < 48) return `${h}j ${m % 60}m`;
+  return `${Math.floor(h / 24)}h ${h % 24}j`;
+}
+
+const fmtWhen = (ts: number | string) => new Date(ts).toLocaleString('id-ID', {
+  day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit',
+});
+
 function fmtAmt(v: number) {
   if (!Number.isFinite(v)) return '—';
   if (v >= 1e9) return (v / 1e9).toFixed(2) + 'B';
@@ -162,8 +175,14 @@ function Dashboard({ session, onAuthFail }: { session: Session; onAuthFail: () =
           <div className="hint">di luar posisi LP</div></div>
         <div className="tile"><div className="label">Nilai posisi LP</div>
           <div className="value">{fmtUsd(pos?.totalValueUsd)}</div></div>
-        <div className="tile"><div className="label">Fee belum diklaim</div>
-          <div className="value">{fmtUsd(pos?.totalFeesUsd)}</div></div>
+        <div className="tile"><div className="label">Total fee</div>
+          <div className="value">{fmtUsd(pos?.totalFeesUsd)}</div>
+          <div className="hint">belum + sudah diklaim</div></div>
+        <div className="tile"><div className="label">Total P&amp;L</div>
+          <div className={`value ${(pos?.totalPnlUsd ?? 0) >= 0 ? 'pos-t' : 'neg-t'}`}>
+            {pos?.totalPnlUsd === 0 ? '±$0.00' : fmtUsd(pos?.totalPnlUsd, true)}
+          </div>
+          <div className="hint">vs modal awal semua posisi</div></div>
         <div className="tile"><div className="label">Posisi aktif</div>
           <div className="value">{pos?.positions?.length ?? '…'}</div>
           <div className="hint">deteksi: {pos?.discovery ?? '…'} · ETH {fmtUsd(pos?.ethUsd)}</div></div>
@@ -173,9 +192,7 @@ function Dashboard({ session, onAuthFail }: { session: Session; onAuthFail: () =
         <button className={`tab ${tab === 'saldo' ? 'active' : ''}`} onClick={() => setTab('saldo')}>Saldo wallet</button>
         <button className={`tab ${tab === 'history' ? 'active' : ''}`} onClick={() => setTab('history')}>History</button>
       </div>
-      {tab === 'saldo' ? <Balances bal={bal} /> : (
-        <p className="muted">Jurnal &amp; history on-chain menyusul di M3 — struktur datanya sudah siap di schema address-mu.</p>
-      )}
+      {tab === 'saldo' ? <Balances bal={bal} /> : <History session={session} onAuthFail={onAuthFail} />}
 
       <h2>Posisi aktif</h2>
       {posErr && <p className="error">Gagal memuat posisi: {posErr} — dicoba lagi otomatis.</p>}
@@ -237,14 +254,64 @@ function PositionCard({ p }: { p: any }) {
         <div><div className="label">Fee belum diklaim</div>
           <div className="val">{fmtUsd(p.feesUsd)}</div>
           <div className="sub">{fmtAmt(d.baseFees)} {d.base} + {fmtAmt(d.quoteFees)} {d.quote}</div></div>
+        <div><div className="label">Umur posisi</div><div className="val">{fmtDur(p.ageMs)}</div></div>
+        <div><div className="label">Modal awal</div>
+          <div className="val">{fmtUsd(p.initialUsd)}</div>
+          <div className="sub">{p.initialSource === 'index' ? 'dari on-chain' : p.initialSource === 'index-estimasi' ? 'on-chain (estimasi)' : 'sejak terpantau'}</div></div>
         <div><div className="label">Nilai posisi</div><div className="val">{fmtUsd(p.valueUsd)}</div></div>
       </div>
+
+      {p.pnlUsd != null && (
+        <div className="pnl-line">
+          Modal {fmtUsd(p.initialUsd)} → nilai {fmtUsd(p.valueUsd)}
+          {' '}(<span className={p.valueUsd - p.initialUsd >= 0 ? 'pos-t' : 'neg-t'}>{fmtUsd(p.valueUsd - p.initialUsd, true)}</span>)
+          {' '}+ fee {fmtUsd(p.feesUsd + (p.collectedFeesUsd ?? 0))} ⇒{' '}
+          <b className={p.pnlUsd >= 0 ? 'pos-t' : 'neg-t'}>
+            P&amp;L {fmtUsd(p.pnlUsd, true)}{p.pnlPct != null ? ` (${p.pnlPct >= 0 ? '+' : ''}${p.pnlPct.toFixed(1)}%)` : ''}
+          </b>
+        </div>
+      )}
 
       <div className="pos-links">
         <a href={`https://www.geckoterminal.com/robinhood/pools/${p.pool}`} target="_blank" rel="noopener">GeckoTerminal ↗</a>
         {p.version === 'v3' && <a href={`${EXPLORER}/address/${p.pool}`} target="_blank" rel="noopener">Pool di explorer ↗</a>}
       </div>
     </article>
+  );
+}
+
+function History({ session, onAuthFail }: { session: Session; onAuthFail: () => void }) {
+  const { data: rows } = useAuthed('/journal', session.token, 120_000, onAuthFail);
+  if (!rows) return <p className="muted">Memuat history…</p>;
+  if (rows.length === 0) {
+    return <p className="muted">Belum ada history — posisi pertama yang kamu tutup akan tercatat di sini otomatis.</p>;
+  }
+  const badge = (side: string) =>
+    side === 'below' ? <span className="status out-below">tembus bawah</span>
+    : side === 'above' ? <span className="status out-above">di atas range</span>
+    : side === 'in' ? <span className="status in">dalam range</span>
+    : <span className="muted">—</span>;
+  return (
+    <div className="table-wrap">
+      <table>
+        <thead>
+          <tr><th>Pair</th><th>Dibuka</th><th>Penutupan</th><th className="num">Modal</th><th className="num">Fee</th><th className="num">P&amp;L $</th><th className="num">P&amp;L %</th></tr>
+        </thead>
+        <tbody>
+          {rows.map((r: any) => (
+            <tr key={r.key}>
+              <td>{r.pair} <span className="badge">{r.version}</span></td>
+              <td>{fmtWhen(r.open_ts)}</td>
+              <td>{badge(r.close_side)}</td>
+              <td className="num">{fmtUsd(Number(r.initial_usd))}</td>
+              <td className="num">{fmtUsd(Number(r.fees_usd))}</td>
+              <td className={`num ${Number(r.pnl_usd) >= 0 ? 'pos-t' : 'neg-t'}`}>{fmtUsd(Number(r.pnl_usd), true)}</td>
+              <td className={`num ${Number(r.pnl_usd) >= 0 ? 'pos-t' : 'neg-t'}`}>{r.pnl_pct != null ? `${Number(r.pnl_pct) >= 0 ? '+' : ''}${Number(r.pnl_pct).toFixed(1)}%` : '—'}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
   );
 }
 

@@ -32,6 +32,10 @@ export const v4StateViewAbi = parseAbi([
   'function getPositionInfo(bytes32 poolId, address owner, int24 tickLower, int24 tickUpper, bytes32 salt) view returns (uint128 liquidity, uint256 feeGrowthInside0LastX128, uint256 feeGrowthInside1LastX128)',
 ]);
 
+export const modifyLiquidityEvent = parseAbi([
+  'event ModifyLiquidity(bytes32 indexed id, address indexed sender, int24 tickLower, int24 tickUpper, int256 liquidityDelta, bytes32 salt)',
+])[0];
+
 export const POOL_KEY_ABI = [{
   type: 'tuple',
   components: [

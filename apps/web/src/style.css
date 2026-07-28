@@ -115,6 +115,11 @@ button.ghost:hover { border-color: var(--muted); }
 .pos-grid .label { color: var(--muted); font-size: 12px; }
 .pos-grid .val { font-variant-numeric: tabular-nums; }
 .pos-grid .sub { color: var(--ink-2); font-size: 12px; }
+.pnl-line {
+  margin-top: 14px; padding: 10px 14px; border-radius: 10px;
+  background: var(--pill-bg); font-size: 14px; font-variant-numeric: tabular-nums;
+}
+.pnl-line b { font-size: 15px; }
 .pos-links { margin-top: 10px; display: flex; gap: 14px; font-size: 13px; }
 .pos-links a { color: var(--accent); text-decoration: none; }
 
