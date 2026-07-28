@@ -302,6 +302,50 @@ function PositionCard({ p, onEditInitial }: { p: any; onEditInitial: (key: strin
 
 const HISTORY_PER_PAGE = 10;
 
+// ISO 8601 dengan offset zona waktu lokal, mis. 2026-07-28T15:14:16+07:00
+function isoLocal(ts: string | null): string {
+  if (!ts) return '';
+  const d = new Date(ts);
+  if (Number.isNaN(d.getTime())) return '';
+  const off = -d.getTimezoneOffset();
+  const p = (n: number) => String(Math.abs(Math.trunc(n))).padStart(2, '0');
+  return (
+    new Date(d.getTime() + off * 60000).toISOString().slice(0, 19) +
+    `${off >= 0 ? '+' : '-'}${p(off / 60)}:${p(off % 60)}`
+  );
+}
+
+function csvField(v: unknown): string {
+  const s = v == null ? '' : String(v);
+  return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+}
+
+function downloadHistoryCsv(rows: any[], address: string) {
+  const header = [
+    'key', 'pair', 'version', 'open_ts', 'close_ts', 'duration_hours',
+    'initial_usd', 'final_usd', 'fees_usd', 'pnl_usd', 'pnl_pct',
+    'close_side', 'source', 'estimated',
+  ];
+  const lines = [header.join(',')];
+  for (const r of rows) {
+    const durH = r.open_ts && r.close_ts
+      ? ((new Date(r.close_ts).getTime() - new Date(r.open_ts).getTime()) / 3_600_000).toFixed(2)
+      : '';
+    lines.push([
+      r.key, r.pair, r.version, isoLocal(r.open_ts), isoLocal(r.close_ts), durH,
+      r.initial_usd ?? '', r.final_usd ?? '', r.fees_usd ?? '',
+      r.pnl_usd ?? '', r.pnl_pct ?? '', r.close_side ?? '', r.source ?? '',
+      r.estimated ? 'true' : 'false',
+    ].map(csvField).join(','));
+  }
+  const blob = new Blob([lines.join('\n') + '\n'], { type: 'text/csv;charset=utf-8' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = `lp-monitor-history-${address.slice(2, 8)}-${new Date().toISOString().slice(0, 10)}.csv`;
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
 function History({ session, onAuthFail }: { session: Session; onAuthFail: () => void }) {
   const { data: rows } = useAuthed('/journal', session.token, 120_000, onAuthFail);
   const [page, setPage] = useState(1);
@@ -345,6 +389,13 @@ function History({ session, onAuthFail }: { session: Session; onAuthFail: () => 
         <div className="tile"><div className="label">Rata-rata durasi</div>
           <div className="value">{fmtDur(avg(rows, durMs))}</div></div>
       </section>
+
+      <div className="history-toolbar">
+        <span className="muted">{rows.length} posisi tertutup</span>
+        <button className="ghost" onClick={() => downloadHistoryCsv(rows, session.address)}>
+          ⬇ Unduh CSV
+        </button>
+      </div>
 
       <div className="table-wrap">
         <table>
