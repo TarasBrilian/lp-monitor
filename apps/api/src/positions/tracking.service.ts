@@ -1,13 +1,23 @@
 import { Injectable } from '@nestjs/common';
-import { pad, toHex } from 'viem';
+import { keccak256, encodeAbiParameters, pad, toHex } from 'viem';
 import { CONTRACTS, EXPLORER, TOKENS, tenantSchema } from '@lpmon/shared';
 import { sql } from '../db.js';
 import { client, isSameAddr } from '../chain/client.js';
-import { modifyLiquidityEvent, v4StateViewAbi } from '../chain/abi.js';
+import { modifyLiquidityEvent, v4StateViewAbi, v4PositionManagerAbi, POOL_KEY_ABI } from '../chain/abi.js';
+import { tokenMeta } from '../chain/tokens.js';
 import { sqrtPriceX96ToSqrtPrice, priceFromSqrt } from '../chain/math.js';
 import { ethUsd, usdPerToken } from '../chain/prices.js';
 import { poolStats } from '../chain/volume.js';
 import { v3Liquidity, v4Liquidity } from '../chain/positions.js';
+
+// Kolom jsonb bisa tiba sebagai string (tergantung mode query driver) — parse defensif
+function parseData(v: unknown): any {
+  if (v == null) return {};
+  if (typeof v === 'string') {
+    try { return JSON.parse(v); } catch { return {}; }
+  }
+  return v;
+}
 
 // Melacak modal awal per posisi di schema milik address (position_track),
 // menghitung P&L, dan memindahkan posisi yang ditutup ke tabel journal.
@@ -35,9 +45,9 @@ export class TrackingService {
     return flows;
   }
 
-  // Fallback saat indeks belum mencakup blok pembukaan: cari event tambah-liquidity
-  // langsung di chain, terfilter poolId (cepat), jendela ~1,5 hari terakhir
-  private async chainAdds(pos: any, salt: `0x${string}`) {
+  // Fallback saat indeks belum mencakup bloknya: cari event liquidity langsung
+  // di chain, terfilter poolId (cepat), jendela ~1,5 hari terakhir
+  private async chainLiquidityEvents(poolId: string, salt: `0x${string}`, sign: 'add' | 'remove') {
     const head = await client.getBlockNumber();
     const CHUNK = 150_000n;
     const start = head > 600_000n ? head - 600_000n : 0n;
@@ -48,17 +58,75 @@ export class TrackingService {
         logs.push(...await client.getLogs({
           address: CONTRACTS.v4PoolManager as `0x${string}`,
           event: modifyLiquidityEvent,
-          args: { id: pos.pool as `0x${string}` },
+          args: { id: poolId as `0x${string}` },
           fromBlock: from, toBlock: to,
         }));
       } catch { /* potongan gagal, lanjut */ }
     }
-    const mine = logs.filter((l) => l.args.salt === salt && l.args.liquidityDelta > 0n);
+    const mine = logs.filter((l) =>
+      l.args.salt === salt && (sign === 'add' ? l.args.liquidityDelta > 0n : l.args.liquidityDelta < 0n));
     return Promise.all(mine.map(async (l) => ({
       tx_hash: l.transactionHash,
       block_number: l.blockNumber,
       timestamp: Number((await client.getBlock({ blockNumber: l.blockNumber })).timestamp),
     })));
+  }
+
+  // Rekonstruksi penutupan dari tx tarik-liquidity asli: nilai penarikan (termasuk
+  // fee) dinilai pada harga pool di blok penutupan. Jauh lebih akurat daripada
+  // snapshot terakhir kalau monitor sempat tidak memantau saat posisi ditutup.
+  private async reconstructClose(key: string, wallet: string) {
+    if (!key.startsWith('v4-')) return null;
+    try {
+      const tokenId = BigInt(key.split('-')[1]);
+      const [poolKey] = await client.readContract({
+        address: CONTRACTS.v4PositionManager as `0x${string}`, abi: v4PositionManagerAbi,
+        functionName: 'getPoolAndPositionInfo', args: [tokenId],
+      });
+      if (/^0x0+$/.test(poolKey.currency0) && /^0x0+$/.test(poolKey.currency1)) return null; // NFT di-burn
+      const [meta0, meta1] = await Promise.all([tokenMeta(poolKey.currency0), tokenMeta(poolKey.currency1)]);
+      const poolId = keccak256(encodeAbiParameters(POOL_KEY_ABI, [poolKey]));
+      const salt = pad(toHex(tokenId), { size: 32 });
+
+      let removes: { tx_hash: string; block_number: bigint | string; timestamp: number }[] = await sql`
+        SELECT tx_hash, block_number, timestamp FROM ponder.liquidity_event
+        WHERE salt = ${salt} AND liquidity_delta < 0 ORDER BY block_number` as any;
+      if (removes.length === 0) removes = await this.chainLiquidityEvents(poolId, salt, 'remove');
+      if (removes.length === 0) return null;
+
+      const pos = { pool: poolId, meta0, meta1 };
+      let finalUsd = 0;
+      let memeUsd = 0;
+      let anchorUsd = 0;
+      let estimated = false;
+      for (const rm of removes) {
+        const hist = await this.usdAtBlock(pos, BigInt(rm.block_number));
+        if (!hist) { estimated = true; }
+        const flows = await this.walletFlows(rm.tx_hash, wallet);
+        for (const [addr, amt] of flows) {
+          let price: number | null = null;
+          if (isSameAddr(addr, TOKENS.USDG)) price = 1;
+          else if (isSameAddr(addr, meta0.address)) price = hist?.usd0 ?? null;
+          else if (isSameAddr(addr, meta1.address)) price = hist?.usd1 ?? null;
+          else continue;
+          if (price == null) { estimated = true; continue; }
+          const v = Math.abs(amt) * price;
+          finalUsd += v;
+          const anchorTok = isSameAddr(addr, TOKENS.USDG) || isSameAddr(addr, TOKENS.WETH);
+          if (anchorTok) anchorUsd += v; else memeUsd += v;
+        }
+      }
+      if (!(finalUsd > 0)) return null;
+      const share = memeUsd + anchorUsd > 0 ? memeUsd / (memeUsd + anchorUsd) : 0;
+      return {
+        finalUsd,
+        closeTs: Number(removes[removes.length - 1].timestamp) * 1000,
+        closeSide: share > 0.95 ? 'below' : share < 0.05 ? 'above' : 'in',
+        estimated,
+      };
+    } catch {
+      return null;
+    }
   }
 
   // Harga USD kedua token pool pada blok tertentu (archive call).
@@ -92,7 +160,7 @@ export class TrackingService {
       let adds: { tx_hash: string; block_number: bigint | string; timestamp: number }[] = await sql`
         SELECT tx_hash, block_number, timestamp FROM ponder.liquidity_event
         WHERE salt = ${salt} AND liquidity_delta > 0 ORDER BY block_number` as any;
-      if (adds.length === 0) adds = await this.chainAdds(pos, salt);
+      if (adds.length === 0) adds = await this.chainLiquidityEvents(pos.pool, salt, 'add');
       if (adds.length === 0) return null;
 
       let initialUsd = 0;
@@ -130,7 +198,8 @@ export class TrackingService {
     const schema = tenantSchema(address);
     const activeKeys = positions.map((p) => p.key);
 
-    const tracks = await sql.unsafe(`SELECT * FROM "${schema}".position_track`);
+    const tracks = (await sql.unsafe(`SELECT * FROM "${schema}".position_track`))
+      .map((t: any) => ({ ...t, data: parseData(t.data) }));
     const byKey = new Map(tracks.map((t: any) => [t.key, t]));
 
     for (const pos of positions) {
@@ -215,14 +284,25 @@ export class TrackingService {
         continue; // tidak bisa diverifikasi — tunda, jangan ambil kesimpulan
       }
       const d = t.data;
+      // Utamakan rekonstruksi dari tx penutupan asli (nilai penarikan riil,
+      // termasuk fee); fallback ke snapshot terakhir kalau tidak tersedia
+      const rec = await this.reconstructClose(t.key, address);
+      const initial = Number(t.initial_usd);
+      const finalUsd = rec?.finalUsd ?? d.valueUsd;
+      const feesUsd = rec ? null : (d.feesUsd ?? 0) + (d.collectedFeesUsd ?? 0);
+      const pnlUsd = rec ? rec.finalUsd - initial : d.pnlUsd;
       await sql.unsafe(
         `INSERT INTO "${schema}".journal
-           (key, pair, version, open_ts, close_ts, initial_usd, final_usd, fees_usd, pnl_usd, pnl_pct, close_side, source)
-         VALUES ($1, $2, $3, $4, now(), $5, $6, $7, $8, $9, $10, 'live')
+           (key, pair, version, open_ts, close_ts, initial_usd, final_usd, fees_usd, pnl_usd, pnl_pct, close_side, source, estimated)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
          ON CONFLICT (key, close_ts) DO NOTHING`,
-        [t.key, d.pair, d.version, t.open_ts, t.initial_usd, d.valueUsd,
-          (d.feesUsd ?? 0) + (d.collectedFeesUsd ?? 0), d.pnlUsd,
-          t.initial_usd > 0 ? (d.pnlUsd / t.initial_usd) * 100 : null, d.closeSide],
+        [t.key, d.pair, d.version, t.open_ts,
+          rec ? new Date(rec.closeTs) : new Date(),
+          initial, finalUsd, feesUsd, pnlUsd,
+          initial > 0 ? (pnlUsd / initial) * 100 : null,
+          rec?.closeSide ?? d.closeSide,
+          rec ? 'live' : 'live-snapshot',
+          rec?.estimated ?? false],
       );
       await sql.unsafe(`DELETE FROM "${schema}".position_track WHERE key = $1`, [t.key]);
     }
