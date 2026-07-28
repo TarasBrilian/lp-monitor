@@ -5,12 +5,15 @@ import { sql } from '../db.js';
 import { client, isSameAddr } from '../chain/client.js';
 import { modifyLiquidityEvent, v4StateViewAbi, v4PositionManagerAbi, POOL_KEY_ABI } from '../chain/abi.js';
 import { tokenMeta, type TokenMeta } from '../chain/tokens.js';
-import { sqrtPriceX96ToSqrtPrice, priceFromSqrt } from '../chain/math.js';
+import { sqrtPriceX96ToSqrtPrice, priceFromSqrt, positionAmounts, toHuman } from '../chain/math.js';
 import { ethUsd, usdPerToken } from '../chain/prices.js';
 import { poolStats } from '../chain/volume.js';
 import { v3Liquidity, v4Liquidity } from '../chain/positions.js';
 
-type LiqEvent = { tx_hash: string; block_number: bigint | string; timestamp: number | string; liquidity_delta: bigint | string };
+type LiqEvent = {
+  tx_hash: string; block_number: bigint | string; timestamp: number | string;
+  liquidity_delta: bigint | string; tick_lower?: number | string; tick_upper?: number | string;
+};
 type Episode = LiqEvent[];
 
 // Kolom jsonb bisa tiba sebagai string (tergantung mode query driver) — parse defensif
@@ -71,7 +74,7 @@ export class TrackingService {
   private async saltEvents(poolId: string | null, tokenId: bigint): Promise<LiqEvent[]> {
     const salt = pad(toHex(tokenId), { size: 32 });
     const rows: LiqEvent[] = await sql`
-      SELECT tx_hash, block_number, timestamp, liquidity_delta
+      SELECT tx_hash, block_number, timestamp, liquidity_delta, tick_lower, tick_upper
       FROM ponder.liquidity_event WHERE salt = ${salt} ORDER BY block_number` as any;
     if (rows.length > 0 || !poolId) return rows;
 
@@ -96,6 +99,8 @@ export class TrackingService {
       block_number: l.blockNumber,
       timestamp: Number((await client.getBlock({ blockNumber: l.blockNumber })).timestamp),
       liquidity_delta: l.args.liquidityDelta,
+      tick_lower: l.args.tickLower,
+      tick_upper: l.args.tickUpper,
     })));
   }
 
@@ -129,7 +134,7 @@ export class TrackingService {
       const usesEthAnchor =
         meta0.native || meta1.native ||
         isSameAddr(meta0.address, TOKENS.WETH) || isSameAddr(meta1.address, TOKENS.WETH);
-      return { usd0, usd1, estimated: usesEthAnchor };
+      return { usd0, usd1, sqrtPriceX96: slot0[0], tick: Number(slot0[1]), estimated: usesEthAnchor };
     } catch {
       return null;
     }
@@ -143,11 +148,24 @@ export class TrackingService {
     let usd = 0;
     let memeUsd = 0;
     let anchorUsd = 0;
+    let principalUsd = 0; // nilai pokok (dari liquidity math) — selisihnya dengan aliran = fee
     let estimated = false;
     for (const ev of events) {
       const hist = await this.usdAtBlock(poolId, meta0, meta1, BigInt(ev.block_number));
       if (!hist) estimated = true;
       else if (hist.estimated) estimated = true;
+
+      if (hist && ev.tick_lower != null && ev.tick_upper != null) {
+        const delta = BigInt(ev.liquidity_delta);
+        const { amount0, amount1 } = positionAmounts({
+          liquidity: delta < 0n ? -delta : delta,
+          tickLower: Number(ev.tick_lower),
+          tickUpper: Number(ev.tick_upper),
+          sqrtPriceX96: hist.sqrtPriceX96,
+          tick: hist.tick,
+        });
+        principalUsd += toHuman(amount0, meta0.decimals) * hist.usd0 + toHuman(amount1, meta1.decimals) * hist.usd1;
+      }
       const flows = await this.walletFlows(ev.tx_hash, wallet);
       for (const [addr, amt] of flows) {
         let price: number | null = null;
@@ -164,7 +182,7 @@ export class TrackingService {
       }
     }
     const share = memeUsd + anchorUsd > 0 ? memeUsd / (memeUsd + anchorUsd) : 0;
-    return { usd, memeShare: share, estimated };
+    return { usd, memeShare: share, principalUsd, estimated };
   }
 
   // Modal awal posisi v4 AKTIF: adds milik episode berjalan (bukan episode lama NFT yang dipakai ulang)
@@ -198,6 +216,10 @@ export class TrackingService {
     const entry = await this.valueEvents(adds, poolId, meta0, meta1, wallet);
     const exit = await this.valueEvents(removes, poolId, meta0, meta1, wallet);
     if (!(entry.usd > 0) || !(exit.usd > 0)) return null;
+    // Fee = total penarikan − pokok (liquidity math di blok penutupan).
+    // Klaim fee terpisah/di tengah episode ikut tertangkap karena semua aliran
+    // tx remove dijumlahkan, sedangkan pokok hanya dari liquidityDelta.
+    const feesUsd = exit.principalUsd > 0 ? Math.max(0, exit.usd - exit.principalUsd) : null;
     const flip = isSameAddr(meta0.address, TOKENS.USDG) ||
       ((meta0.native || isSameAddr(meta0.address, TOKENS.WETH)) && !isSameAddr(meta1.address, TOKENS.USDG));
     const base = flip ? meta1.symbol : meta0.symbol;
@@ -209,6 +231,7 @@ export class TrackingService {
       closeTs: Number(removes[removes.length - 1].timestamp) * 1000,
       initialUsd: entry.usd,
       finalUsd: exit.usd,
+      feesUsd,
       pnlUsd: exit.usd - entry.usd,
       closeSide: exit.memeShare > 0.95 ? 'below' : exit.memeShare < 0.05 ? 'above' : 'in',
       estimated: entry.estimated || exit.estimated,
@@ -230,9 +253,16 @@ export class TrackingService {
         FROM ponder.position_transfer
         ORDER BY version, token_id, block_number DESC, id DESC
       ) latest
-      WHERE version = 'v4' AND lower(latest."to") = ${address.toLowerCase()}`;
+      WHERE version = 'v4' AND lower(latest."to") = ${address.toLowerCase()}
+      ORDER BY token_id DESC`; // terbaru dulu: entri terkini kebagian jatah heavy-ops duluan
+
+    // Pekerjaan berat (rekonstruksi via Blockscout + archive call) dibatasi per
+    // poll supaya request dashboard tidak menggantung; sisanya poll berikutnya
+    let heavyOps = 0;
+    const MAX_HEAVY = 4;
 
     for (const { token_id } of owned as any[]) {
+      if (heavyOps >= MAX_HEAVY) break;
       const tokenId = BigInt(token_id);
       const key = `v4-${tokenId}`;
       const events = await this.saltEvents(null, tokenId);
@@ -240,28 +270,41 @@ export class TrackingService {
       if (episodes.length === 0) continue;
       let meta: Awaited<ReturnType<typeof this.poolMeta>> = null;
       for (const ep of episodes) {
+        if (heavyOps >= MAX_HEAVY) break;
         const closeTs = Number(ep[ep.length - 1].timestamp) * 1000;
         const [exists] = await sql.unsafe(
-          `SELECT 1 FROM "${schema}".journal
+          `SELECT id, fees_usd, source FROM "${schema}".journal
            WHERE key = $1 AND ABS(EXTRACT(EPOCH FROM close_ts) - $2) < 180`,
           [key, closeTs / 1000],
         );
-        if (exists) continue;
-        // posisi aktif dengan episode lama yang belum dijurnal tetap dipulihkan;
-        // episode berjalan tidak tersentuh karena hanya episode TERTUTUP di sini
+        // entri lengkap (sudah ada fee) tidak disentuh; entri tanpa fee
+        // (impor v1 / rekonstruksi lama) di-backfill dengan pemisahan fee
+        if (exists && exists.fees_usd != null) continue;
         meta ??= await this.poolMeta(tokenId);
         if (!meta) break;
         const rec = await this.reconstructEpisode(tokenId, ep, meta.poolId, meta.meta0, meta.meta1, address);
+        heavyOps++;
         if (!rec) continue;
-        await sql.unsafe(
-          `INSERT INTO "${schema}".journal
-             (key, pair, version, open_ts, close_ts, initial_usd, final_usd, fees_usd, pnl_usd, pnl_pct, close_side, source, estimated)
-           VALUES ($1,$2,'v4',$3,$4,$5,$6,NULL,$7,$8,$9,'rekonstruksi',$10)
-           ON CONFLICT (key, close_ts) DO NOTHING`,
-          [rec.key, rec.pair, new Date(rec.openTs), new Date(rec.closeTs), rec.initialUsd, rec.finalUsd,
-            rec.pnlUsd, rec.initialUsd > 0 ? (rec.pnlUsd / rec.initialUsd) * 100 : null,
-            rec.closeSide, rec.estimated],
-        );
+        const pnlPct = rec.initialUsd > 0 ? (rec.pnlUsd / rec.initialUsd) * 100 : null;
+        if (exists) {
+          await sql.unsafe(
+            `UPDATE "${schema}".journal
+             SET open_ts = $2, initial_usd = $3, final_usd = $4, fees_usd = $5,
+                 pnl_usd = $6, pnl_pct = $7, close_side = $8, estimated = $9
+             WHERE id = $1`,
+            [exists.id, new Date(rec.openTs), rec.initialUsd, rec.finalUsd, rec.feesUsd,
+              rec.pnlUsd, pnlPct, rec.closeSide, rec.estimated],
+          );
+        } else {
+          await sql.unsafe(
+            `INSERT INTO "${schema}".journal
+               (key, pair, version, open_ts, close_ts, initial_usd, final_usd, fees_usd, pnl_usd, pnl_pct, close_side, source, estimated)
+             VALUES ($1,$2,'v4',$3,$4,$5,$6,$7,$8,$9,$10,'rekonstruksi',$11)
+             ON CONFLICT (key, close_ts) DO NOTHING`,
+            [rec.key, rec.pair, new Date(rec.openTs), new Date(rec.closeTs), rec.initialUsd, rec.finalUsd,
+              rec.feesUsd, rec.pnlUsd, pnlPct, rec.closeSide, rec.estimated],
+          );
+        }
       }
     }
   }
@@ -370,7 +413,7 @@ export class TrackingService {
       }
       const initial = rec?.initialUsd ?? Number(t.initial_usd);
       const finalUsd = rec?.finalUsd ?? d.valueUsd;
-      const feesUsd = rec ? null : (d.feesUsd ?? 0) + (d.collectedFeesUsd ?? 0);
+      const feesUsd = rec ? rec.feesUsd : (d.feesUsd ?? 0) + (d.collectedFeesUsd ?? 0);
       const pnlUsd = rec ? rec.pnlUsd : d.pnlUsd;
       await sql.unsafe(
         `INSERT INTO "${schema}".journal
