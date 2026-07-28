@@ -131,7 +131,7 @@ export function App() {
       </main>
       <footer>
         Data: indeks Ponder + RPC resmi Robinhood Chain + Blockscout + GeckoTerminal (semua gratis).
-        P&amp;L lengkap &amp; jurnal menyusul di M3.
+        P&amp;L = (nilai sekarang + semua fee) − modal awal.
       </footer>
     </>
   );

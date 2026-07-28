@@ -15,7 +15,7 @@ Penerus `lp-monitor` v1 (v1 tetap jalan sampai v2 mencapai paritas fitur).
 | Indexer | Ponder — mengindeks PoolManager v4 + PositionManager v3/v4 |
 | Database | PostgreSQL. Data indeks on-chain: schema `ponder` (satu untuk semua). Data aplikasi: **satu schema per address** (`addr_<address>`): jurnal, alert, setting, baseline |
 | Alert | Notifikasi browser (Web Push + service worker, VAPID) |
-| Deploy | Docker Compose — portabel ke VPS mana pun. Dev: hanya Postgres di Docker |
+| Deploy | Frontend: Vercel (proxy /api → VPS). Backend: VPS (pm2: API via Bun, indexer via Node 22, Postgres native). Dev lokal: Postgres di Docker |
 | Biaya infra | $0 di luar VPS: RPC publik resmi, tanpa API berbayar |
 
 ## Struktur monorepo
@@ -94,9 +94,14 @@ Status per 28 Jul 2026:
    Rule engine server-side (near-lower, tembus bawah, di atas range, P&L flip,
    volume kering/spike) + Web Push per user.
 
-5. **M5 — Deploy** ⬜ BELUM MULAI
-   Compose produksi (api+web+indexer+postgres), panduan VPS, hardening
-   (basic auth/rate limit API), lalu pensiunkan v1.
+5. **M5 — Deploy** 🔶 SEBAGIAN (28 Jul 2026)
+   Live: frontend di Vercel (https://lp-monitor-five.vercel.app, rewrite
+   /api/* → VPS), backend di VPS 103.127.134.131 (API port 8790 via Bun+pm2,
+   indexer Ponder port 42070 via Node 22/nvm+pm2, Postgres native lokal,
+   pm2 startup systemd). Data journal termigrasi (pg_dump schema addr_*).
+   Indexer VPS backfill dalam dari blok 16 jt (START_BLOCK env).
+   Belum: HTTPS/domain untuk jalur API, hardening akses server & database,
+   rate limit API.
 
 ## Konvensi
 

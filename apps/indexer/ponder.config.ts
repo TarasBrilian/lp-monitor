@@ -23,8 +23,11 @@ export default createConfig({
   chains: {
     robinhood: {
       id: CHAIN_ID,
-      rpc: process.env.RPC_URL ?? DEFAULT_RPC,
-      pollingInterval: 2_000,
+      // Hybrid: indexer boleh pakai RPC berbayar (PONDER_RPC_URL) sementara
+      // API tetap di RPC publik — hemat kuota berbayar
+      rpc: process.env.PONDER_RPC_URL ?? process.env.RPC_URL ?? DEFAULT_RPC,
+      // 20 dtk cukup untuk LP monitoring dan hemat kuota RPC (override: POLLING_MS)
+      pollingInterval: Number(process.env.POLLING_MS ?? 20_000),
     },
   },
   contracts: {
