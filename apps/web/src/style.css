@@ -115,6 +115,11 @@ button.ghost:hover { border-color: var(--muted); }
 .pos-grid .label { color: var(--muted); font-size: 12px; }
 .pos-grid .val { font-variant-numeric: tabular-nums; }
 .pos-grid .sub { color: var(--ink-2); font-size: 12px; }
+.tiles.small { margin: 0 0 14px; }
+.tiles.small .tile .value { font-size: 18px; }
+.editable { cursor: pointer; border-bottom: 1px dashed var(--muted); display: inline-block; }
+.pager { display: flex; align-items: center; justify-content: center; gap: 14px; margin-top: 12px; }
+.pager button[disabled] { opacity: .4; cursor: default; }
 .pnl-line {
   margin-top: 14px; padding: 10px 14px; border-radius: 10px;
   background: var(--pill-bg); font-size: 14px; font-variant-numeric: tabular-nums;

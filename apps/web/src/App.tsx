@@ -60,7 +60,7 @@ export function App() {
     if (h.get('token') && h.get('address')) {
       const s = { token: h.get('token')!, address: h.get('address')!, schema: '' };
       localStorage.setItem('lpmon-session', JSON.stringify(s));
-      history.replaceState(null, '', location.pathname);
+      history.replaceState(null, '', location.pathname + location.search);
       return s;
     }
     const raw = localStorage.getItem('lpmon-session');
@@ -137,7 +137,7 @@ export function App() {
   );
 }
 
-function useAuthed(path: string, token: string, refreshMs: number, onAuthFail: () => void) {
+function useAuthed(path: string, token: string, refreshMs: number, onAuthFail: () => void, reloadKey = 0) {
   const [data, setData] = useState<any>(null);
   const [err, setErr] = useState<string | null>(null);
   useEffect(() => {
@@ -153,14 +153,29 @@ function useAuthed(path: string, token: string, refreshMs: number, onAuthFail: (
     load();
     const t = setInterval(load, refreshMs);
     return () => { stop = true; clearInterval(t); };
-  }, [path, token]);
+  }, [path, token, reloadKey]);
   return { data, err };
 }
 
 function Dashboard({ session, onAuthFail }: { session: Session; onAuthFail: () => void }) {
-  const { data: pos, err: posErr } = useAuthed('/positions', session.token, 60_000, onAuthFail);
+  const [reloadKey, setReloadKey] = useState(0);
+  const { data: pos, err: posErr } = useAuthed('/positions', session.token, 60_000, onAuthFail, reloadKey);
   const { data: bal } = useAuthed('/balances', session.token, 120_000, onAuthFail);
-  const [tab, setTab] = useState<'saldo' | 'history'>('saldo');
+  const [tab, setTab] = useState<'saldo' | 'history'>(
+    () => (new URLSearchParams(location.search).get('tab') === 'history' ? 'history' : 'saldo'),
+  );
+
+  async function editInitial(key: string) {
+    const usd = prompt('Koreksi modal awal posisi ini (USD):');
+    if (!usd) return;
+    const res = await api(`/positions/${key}/initial`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${session.token}` },
+      body: JSON.stringify({ usd: Number(usd) }),
+    });
+    if (res.ok) setReloadKey((k) => k + 1);
+    else alert((await res.json()).message ?? 'Gagal menyimpan');
+  }
 
   const totalAset = (bal?.totalUsd ?? 0) + (pos?.totalValueUsd ?? 0) + (pos?.totalFeesUsd ?? 0);
 
@@ -200,12 +215,12 @@ function Dashboard({ session, onAuthFail }: { session: Session; onAuthFail: () =
       {pos?.positions?.length === 0 && (
         <p className="muted">Tidak ada posisi LP aktif. Buka posisi di Uniswap, muncul otomatis maksimal 1 menit.</p>
       )}
-      {pos?.positions?.map((p: any) => <PositionCard key={p.key} p={p} />)}
+      {pos?.positions?.map((p: any) => <PositionCard key={p.key} p={p} onEditInitial={editInitial} />)}
     </>
   );
 }
 
-function PositionCard({ p }: { p: any }) {
+function PositionCard({ p, onEditInitial }: { p: any; onEditInitial: (key: string) => void }) {
   const d = p.disp;
   const logPct = (() => {
     if (!(d.upper > d.lower) || !(d.price > 0) || !(d.lower > 0)) return null;
@@ -255,9 +270,14 @@ function PositionCard({ p }: { p: any }) {
           <div className="val">{fmtUsd(p.feesUsd)}</div>
           <div className="sub">{fmtAmt(d.baseFees)} {d.base} + {fmtAmt(d.quoteFees)} {d.quote}</div></div>
         <div><div className="label">Umur posisi</div><div className="val">{fmtDur(p.ageMs)}</div></div>
+        <div><div className="label">Volume 24 jam pool</div>
+          <div className="val">{p.vol24 != null ? `$${fmtAmt(p.vol24)}` : '—'}</div>
+          {p.baselineVol24 != null && p.vol24 != null && (
+            <div className="sub">{((p.vol24 / p.baselineVol24 - 1) * 100).toFixed(0)}% vs entry</div>
+          )}</div>
         <div><div className="label">Modal awal</div>
-          <div className="val">{fmtUsd(p.initialUsd)}</div>
-          <div className="sub">{p.initialSource === 'index' ? 'dari on-chain' : p.initialSource === 'index-estimasi' ? 'on-chain (estimasi)' : 'sejak terpantau'}</div></div>
+          <div className="val editable" title="Klik untuk koreksi manual" onClick={() => onEditInitial(p.key)}>{fmtUsd(p.initialUsd)}</div>
+          <div className="sub">{p.initialSource === 'index' ? 'dari on-chain' : p.initialSource === 'index-estimasi' ? 'on-chain (estimasi)' : p.initialSource === 'manual' ? 'manual' : 'sejak terpantau'}</div></div>
         <div><div className="label">Nilai posisi</div><div className="val">{fmtUsd(p.valueUsd)}</div></div>
       </div>
 
@@ -280,38 +300,82 @@ function PositionCard({ p }: { p: any }) {
   );
 }
 
+const HISTORY_PER_PAGE = 10;
+
 function History({ session, onAuthFail }: { session: Session; onAuthFail: () => void }) {
   const { data: rows } = useAuthed('/journal', session.token, 120_000, onAuthFail);
+  const [page, setPage] = useState(1);
   if (!rows) return <p className="muted">Memuat history…</p>;
   if (rows.length === 0) {
     return <p className="muted">Belum ada history — posisi pertama yang kamu tutup akan tercatat di sini otomatis.</p>;
   }
+
+  const num = (v: any) => (v == null ? null : Number(v));
+  const wins = rows.filter((r: any) => num(r.pnl_usd)! > 0);
+  const losses = rows.filter((r: any) => num(r.pnl_usd)! <= 0);
+  const feeRows = rows.filter((r: any) => r.fees_usd != null);
+  const totalPnl = rows.reduce((s: number, r: any) => s + (num(r.pnl_usd) ?? 0), 0);
+  const avg = (arr: any[], f: (r: any) => number) => (arr.length ? arr.reduce((s, r) => s + f(r), 0) / arr.length : 0);
+  const durMs = (r: any) => (r.open_ts && r.close_ts ? new Date(r.close_ts).getTime() - new Date(r.open_ts).getTime() : 0);
+
+  const pages = Math.max(1, Math.ceil(rows.length / HISTORY_PER_PAGE));
+  const cur = Math.min(Math.max(1, page), pages);
+  const slice = rows.slice((cur - 1) * HISTORY_PER_PAGE, cur * HISTORY_PER_PAGE);
+
   const badge = (side: string) =>
     side === 'below' ? <span className="status out-below">tembus bawah</span>
     : side === 'above' ? <span className="status out-above">di atas range</span>
     : side === 'in' ? <span className="status in">dalam range</span>
     : <span className="muted">—</span>;
+
   return (
-    <div className="table-wrap">
-      <table>
-        <thead>
-          <tr><th>Pair</th><th>Dibuka</th><th>Penutupan</th><th className="num">Modal</th><th className="num">Fee</th><th className="num">P&amp;L $</th><th className="num">P&amp;L %</th></tr>
-        </thead>
-        <tbody>
-          {rows.map((r: any) => (
-            <tr key={r.key}>
-              <td>{r.pair} <span className="badge">{r.version}</span></td>
-              <td>{fmtWhen(r.open_ts)}</td>
-              <td>{badge(r.close_side)}</td>
-              <td className="num">{fmtUsd(Number(r.initial_usd))}</td>
-              <td className="num">{fmtUsd(Number(r.fees_usd))}</td>
-              <td className={`num ${Number(r.pnl_usd) >= 0 ? 'pos-t' : 'neg-t'}`}>{fmtUsd(Number(r.pnl_usd), true)}</td>
-              <td className={`num ${Number(r.pnl_usd) >= 0 ? 'pos-t' : 'neg-t'}`}>{r.pnl_pct != null ? `${Number(r.pnl_pct) >= 0 ? '+' : ''}${Number(r.pnl_pct).toFixed(1)}%` : '—'}</td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
-    </div>
+    <>
+      <section className="tiles small">
+        <div className="tile"><div className="label">Total P&amp;L tertutup</div>
+          <div className={`value ${totalPnl >= 0 ? 'pos-t' : 'neg-t'}`}>{fmtUsd(totalPnl, true)}</div></div>
+        <div className="tile"><div className="label">Win rate</div>
+          <div className="value">{((wins.length / rows.length) * 100).toFixed(0)}%</div>
+          <div className="hint">{wins.length} profit / {losses.length} rugi</div></div>
+        <div className="tile"><div className="label">Rata-rata fee</div>
+          <div className="value">{feeRows.length ? fmtUsd(avg(feeRows, (r) => num(r.fees_usd)!)) : '—'}</div>
+          <div className="hint">{feeRows.length ? `dari ${feeRows.length} posisi terpantau` : 'fee posisi lama termasuk di penarikan'}</div></div>
+        <div className="tile"><div className="label">Rata-rata rugi</div>
+          <div className="value">{losses.length ? fmtUsd(avg(losses, (r) => num(r.pnl_usd)!)) : '—'}</div>
+          <div className="hint">per posisi rugi</div></div>
+        <div className="tile"><div className="label">Rata-rata durasi</div>
+          <div className="value">{fmtDur(avg(rows, durMs))}</div></div>
+      </section>
+
+      <div className="table-wrap">
+        <table>
+          <thead>
+            <tr><th>Pair</th><th>Dibuka</th><th>Durasi</th><th>Penutupan</th><th className="num">Modal</th><th className="num">Fee</th><th className="num">P&amp;L $</th><th className="num">P&amp;L %</th></tr>
+          </thead>
+          <tbody>
+            {slice.map((r: any) => (
+              <tr key={r.key}>
+                <td>{r.pair} <span className="badge">{r.version}</span>{r.source === 'rekonstruksi' && <span className="badge" title="Direkonstruksi dari transaksi on-chain"> on-chain</span>}</td>
+                <td>{r.open_ts ? fmtWhen(r.open_ts) : '—'}</td>
+                <td>{fmtDur(durMs(r))}</td>
+                <td>{badge(r.close_side)}</td>
+                <td className="num">{fmtUsd(num(r.initial_usd))}</td>
+                <td className="num">{r.fees_usd != null ? fmtUsd(num(r.fees_usd)) : <span className="muted" title="Fee sudah termasuk di nilai penarikan">—</span>}</td>
+                <td className={`num ${num(r.pnl_usd)! >= 0 ? 'pos-t' : 'neg-t'}`}>{r.estimated ? '≈' : ''}{fmtUsd(num(r.pnl_usd), true)}</td>
+                <td className={`num ${num(r.pnl_usd)! >= 0 ? 'pos-t' : 'neg-t'}`}>{r.pnl_pct != null ? `${num(r.pnl_pct)! >= 0 ? '+' : ''}${num(r.pnl_pct)!.toFixed(1)}%` : '—'}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+
+      {pages > 1 && (
+        <div className="pager">
+          <button className="ghost" disabled={cur <= 1} onClick={() => setPage(cur - 1)}>‹ Sebelumnya</button>
+          <span className="muted">Halaman {cur} / {pages} · {rows.length} posisi</span>
+          <button className="ghost" disabled={cur >= pages} onClick={() => setPage(cur + 1)}>Berikutnya ›</button>
+        </div>
+      )}
+    </>
   );
 }
 

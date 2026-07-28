@@ -80,16 +80,15 @@ Status per 28 Jul 2026:
    rate-limited — laju sync hanya setara laju chain. Backfill dalam (era
    posisi lama) menunggu RPC lebih longgar di VPS; tinggal ubah START_BLOCK.*
 
-3. **M3 — Paritas v1** 🔶 SEBAGIAN BESAR SELESAI
-   Sudah: nilai posisi + fee real-time (v3/v4), saldo wallet (+ deteksi token
-   palsu), modal awal akurat (rekonstruksi dari tx pembukaan, dinilai pada
-   harga blok kejadian, self-healing), P&L per posisi + total, jurnal otomatis
-   saat posisi ditutup (schema address), tab History dari jurnal, UI paritas
-   v1 (tiles, kartu posisi, range bar log, pill status).
-   Belum: volume pool 24 jam + baseline entry, statistik History (win rate,
-   rata-rata fee/rugi) + pagination 10/halaman, koreksi manual modal awal,
-   rekonstruksi riwayat lama pra-indeks (40 posisi lama user pertama — sudah
-   ada di data v1).
+3. **M3 — Paritas v1** ✅ SELESAI
+   Nilai posisi + fee real-time (v3/v4), saldo wallet (+ deteksi token palsu),
+   modal awal akurat (rekonstruksi dari tx pembukaan, dinilai pada harga blok
+   kejadian, self-healing), P&L per posisi + total, jurnal otomatis saat
+   posisi ditutup (schema address), volume pool 24 jam + baseline entry,
+   koreksi manual modal awal (klik di kartu posisi), tab History lengkap
+   (statistik win rate / rata-rata fee / rata-rata rugi / durasi + pagination
+   10/halaman), riwayat v1 terimpor via `apps/api/scripts/import-v1.ts`,
+   UI paritas v1 penuh.
 
 4. **M4 — Alert** ⬜ BELUM MULAI
    Rule engine server-side (near-lower, tembus bawah, di atas range, P&L flip,

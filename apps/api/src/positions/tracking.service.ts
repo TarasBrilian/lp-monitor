@@ -6,6 +6,7 @@ import { client, isSameAddr } from '../chain/client.js';
 import { modifyLiquidityEvent, v4StateViewAbi } from '../chain/abi.js';
 import { sqrtPriceX96ToSqrtPrice, priceFromSqrt } from '../chain/math.js';
 import { ethUsd, usdPerToken } from '../chain/prices.js';
+import { poolStats } from '../chain/volume.js';
 
 // Melacak modal awal per posisi di schema milik address (position_track),
 // menghitung P&L, dan memindahkan posisi yang ditutup ke tabel journal.
@@ -176,11 +177,21 @@ export class TrackingService {
       pos.pnlUsd = pos.valueUsd + pos.feesUsd + pos.collectedFeesUsd - pos.initialUsd;
       pos.pnlPct = pos.initialUsd > 0 ? (pos.pnlUsd / pos.initialUsd) * 100 : null;
 
+      // Volume pool 24 jam + baseline saat pertama terpantau (untuk alert M4)
+      const stats = await poolStats(pos.pool).catch(() => null);
+      pos.vol24 = stats?.volume24hUsd ?? null;
+      pos.reserveUsd = stats?.reserveUsd ?? null;
+      let baselineVol24 = track.data?.baselineVol24 ?? null;
+      if (baselineVol24 == null && stats && stats.volume24hUsd > 0) {
+        baselineVol24 = stats.volume24hUsd;
+      }
+      pos.baselineVol24 = baselineVol24;
+
       await sql.unsafe(
         `UPDATE "${schema}".position_track SET data = $2, updated_at = now() WHERE key = $1`,
         [pos.key, JSON.stringify({
           pair: pos.pair, version: pos.version, valueUsd: pos.valueUsd, feesUsd: pos.feesUsd,
-          collectedFeesUsd: pos.collectedFeesUsd, pnlUsd: pos.pnlUsd,
+          collectedFeesUsd: pos.collectedFeesUsd, pnlUsd: pos.pnlUsd, baselineVol24,
           rangeLower: pos.disp.lower, rangeUpper: pos.disp.upper, lastPrice: pos.disp.price,
           quote: pos.disp.quote, closeSide: pos.inRange ? 'in' : pos.outSide,
         })],
@@ -207,5 +218,18 @@ export class TrackingService {
   async journal(address: string) {
     const schema = tenantSchema(address);
     return sql.unsafe(`SELECT * FROM "${schema}".journal ORDER BY close_ts DESC`);
+  }
+
+  // Koreksi manual modal awal (tidak akan ditimpa self-healing)
+  async setInitial(address: string, key: string, usd: number): Promise<boolean> {
+    if (!Number.isFinite(usd) || usd <= 0) return false;
+    const schema = tenantSchema(address);
+    const res = await sql.unsafe(
+      `UPDATE "${schema}".position_track
+       SET initial_usd = $2, initial_source = 'manual', updated_at = now()
+       WHERE key = $1`,
+      [key, usd],
+    );
+    return (res as any).count > 0;
   }
 }

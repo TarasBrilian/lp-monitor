@@ -18,6 +18,10 @@ export class PositionsService {
   private knownEmpty = new Map<string, number>(); // key posisi -> ts terakhir dicek kosong
   private listCache = new Map<string, { ts: number; data: unknown }>();
 
+  invalidate(address: string) {
+    this.listCache.delete(address.toLowerCase());
+  }
+
   // Discovery utama dari indeks Ponder; fallback ke Blockscout selama backfill
   // indeks belum mengejar ujung chain.
   private async discover(address: string): Promise<Discovered> {
