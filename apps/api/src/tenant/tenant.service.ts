@@ -1,13 +1,32 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, OnModuleInit } from '@nestjs/common';
 import { tenantSchema } from '@lpmon/shared';
 import { sql } from '../db.js';
 
 // Satu address = satu schema Postgres berisi data aplikasi miliknya.
 // Idempoten: aman dipanggil setiap login.
 @Injectable()
-export class TenantService {
+export class TenantService implements OnModuleInit {
+  // Migrasi schema yang sudah ada dijalankan saat boot — perubahan DDL berlaku
+  // tanpa menunggu user login ulang
+  async onModuleInit() {
+    try {
+      const rows = await sql`
+        SELECT schema_name FROM information_schema.schemata
+        WHERE schema_name LIKE 'addr\\_%'`;
+      for (const r of rows) await this.ensure(r.schema_name);
+      if (rows.length) console.log(`[tenant] ${rows.length} schema dimigrasi saat boot`);
+    } catch (err: any) {
+      console.warn('[tenant] migrasi startup gagal:', err.message);
+    }
+  }
+
   async provision(address: string): Promise<string> {
     const schema = tenantSchema(address);
+    await this.ensure(schema);
+    return schema;
+  }
+
+  private async ensure(schema: string): Promise<void> {
     await sql.unsafe(`CREATE SCHEMA IF NOT EXISTS "${schema}"`);
     await sql.unsafe(`
       CREATE TABLE IF NOT EXISTS "${schema}".journal (
@@ -25,8 +44,14 @@ export class TenantService {
         close_side  text,
         source      text NOT NULL DEFAULT 'live',
         estimated   boolean NOT NULL DEFAULT false,
+        collects_checked boolean NOT NULL DEFAULT false,
         created_at  timestamptz NOT NULL DEFAULT now()
       )`);
+    // collects_checked = klaim fee di tengah episode sudah diperhitungkan; entri
+    // lama (false) yang episodenya punya klaim akan di-backfill TrackingService
+    await sql.unsafe(`
+      ALTER TABLE "${schema}".journal
+      ADD COLUMN IF NOT EXISTS collects_checked boolean NOT NULL DEFAULT false`);
     // Satu NFT bisa dipakai ulang (tutup lalu isi liquidity lagi) = beberapa
     // episode per key — karena itu PK bukan di key, tapi unik per (key, close_ts).
     // Migrasi idempoten untuk schema yang dibuat sebelum aturan ini:
@@ -70,6 +95,5 @@ export class TenantService {
         key   text PRIMARY KEY,
         value jsonb NOT NULL
       )`);
-    return schema;
   }
 }

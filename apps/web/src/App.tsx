@@ -268,7 +268,10 @@ function PositionCard({ p, onEditInitial }: { p: any; onEditInitial: (key: strin
           <div className="val">{fmtAmt(d.quoteAmt)} <span className="sub">≈ {fmtUsd(d.quoteAmt * (d.quoteUsd ?? 0))}</span></div></div>
         <div><div className="label">Fee belum diklaim</div>
           <div className="val">{fmtUsd(p.feesUsd)}</div>
-          <div className="sub">{fmtAmt(d.baseFees)} {d.base} + {fmtAmt(d.quoteFees)} {d.quote}</div></div>
+          <div className="sub">{fmtAmt(d.baseFees)} {d.base} + {fmtAmt(d.quoteFees)} {d.quote}</div>
+          {(p.collectedFeesUsd ?? 0) > 0 && (
+            <div className="sub pos-t">+ {fmtUsd(p.collectedFeesUsd)} sudah diklaim</div>
+          )}</div>
         <div><div className="label">Umur posisi</div><div className="val">{fmtDur(p.ageMs)}</div></div>
         <div><div className="label">Volume 24 jam pool</div>
           <div className="val">{p.vol24 != null ? `$${fmtAmt(p.vol24)}` : '—'}</div>

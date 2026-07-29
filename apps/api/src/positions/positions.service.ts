@@ -109,7 +109,7 @@ export class PositionsService {
       ...ids.v3.map((id) => readV3Position(id, address as `0x${string}`, eth)),
     ]);
 
-    const positions = [];
+    const positions: any[] = []; // enrich menambahkan field P&L/fee secara dinamis
     for (const r of results) {
       if (r.status !== 'fulfilled') continue;
       const pos = r.value;

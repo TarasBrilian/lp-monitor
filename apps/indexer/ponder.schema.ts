@@ -23,6 +23,21 @@ export const liquidityEvent = onchainTable('liquidity_event', (t) => ({
   txHash: t.hex().notNull(),
 }));
 
+// Event liquidity/fee NFPM v3 per tokenId. `kind`: increase | decrease | collect.
+// collect membayar tokensOwed = pokok hasil decrease + fee — pemisahan fee
+// dilakukan di API dengan mengurangkan pokok decrease yang belum terbayar.
+export const v3PositionEvent = onchainTable('v3_position_event', (t) => ({
+  id: t.text().primaryKey(), // txHash-logIndex
+  tokenId: t.bigint().notNull(),
+  kind: t.text().notNull(),
+  liquidity: t.bigint().notNull(), // 0 untuk collect
+  amount0: t.bigint().notNull(),
+  amount1: t.bigint().notNull(),
+  blockNumber: t.bigint().notNull(),
+  timestamp: t.bigint().notNull(),
+  txHash: t.hex().notNull(),
+}));
+
 export const positionTransfer = onchainTable('position_transfer', (t) => ({
   id: t.text().primaryKey(), // version-txHash-logIndex
   version: t.text().notNull(), // 'v3' | 'v4'
