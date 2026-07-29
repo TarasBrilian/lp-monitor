@@ -42,6 +42,17 @@ function segmentEpisodes(events: LiqEvent[]): { episodes: Episode[]; open: Episo
   return { episodes, open: current.length ? current : null };
 }
 
+// Event v3 (increase/decrease/collect) → bentuk LiqEvent untuk segmentEpisodes
+function v3ToDeltas(rows: any[]): any[] {
+  return rows.map((r) => ({
+    ...r,
+    liquidity_delta:
+      r.kind === 'increase' ? BigInt(r.liquidity)
+      : r.kind === 'decrease' ? -BigInt(r.liquidity)
+      : 0n,
+  }));
+}
+
 // Melacak modal awal per posisi di schema milik address (position_track),
 // menghitung P&L, memindahkan posisi tertutup ke journal, dan memulihkan
 // episode yang terlewat (buka-tutup saat monitor tidak memantau) dari indeks.
@@ -188,9 +199,12 @@ export class TrackingService {
     return { usd, memeShare: share, principalUsd, estimated };
   }
 
-  // Modal awal posisi v4 AKTIF: adds milik episode berjalan (bukan episode lama NFT yang dipakai ulang)
-  private async reconstructEntry(pos: any, wallet: string): Promise<{ initialUsd: number; openTs: number; source: string } | null> {
-    if (pos.version !== 'v4') return null;
+  // Modal awal posisi AKTIF: semua adds milik episode berjalan (bukan episode
+  // lama NFT yang dipakai ulang). lastAddBlock = blok add terakhir yang sudah
+  // masuk hitungan — dipakai mendeteksi add liquidity susulan.
+  private async reconstructEntry(pos: any, wallet: string, indexFresh = false):
+    Promise<{ initialUsd: number; openTs: number; source: string; lastAddBlock: number } | null> {
+    if (pos.version !== 'v4') return this.reconstructEntryV3(pos, indexFresh);
     try {
       const events = await this.saltEvents(pos.pool, BigInt(pos.tokenId));
       const { open } = segmentEpisodes(events);
@@ -203,10 +217,86 @@ export class TrackingService {
         initialUsd: usd,
         openTs: Number(adds[0].timestamp) * 1000,
         source: estimated ? 'index-estimasi' : 'index',
+        lastAddBlock: Number(adds[adds.length - 1].block_number),
       };
     } catch {
       return null;
     }
+  }
+
+  // Modal awal v3: jumlah amount0/amount1 semua IncreaseLiquidity episode
+  // berjalan, dinilai pada harga pool di blok masing-masing. Amount event =
+  // yang benar-benar masuk posisi (refund NFPM otomatis tak terhitung).
+  private async reconstructEntryV3(pos: any, indexFresh: boolean):
+    Promise<{ initialUsd: number; openTs: number; source: string; lastAddBlock: number } | null> {
+    try {
+      const rows = await this.v3Events(BigInt(pos.tokenId), indexFresh);
+      if (!rows || rows.length === 0) return null;
+      const { open } = segmentEpisodes(v3ToDeltas(rows));
+      if (!open) return null;
+      const incs = (open as any[]).filter((e) => e.kind === 'increase');
+      if (incs.length === 0) return null;
+      let usd = 0;
+      let estimated = false;
+      for (const inc of incs) {
+        const { usd0, usd1, estimated: est } = await this.v3UsdAtBlock(pos, BigInt(inc.block_number));
+        if (est) estimated = true;
+        if (usd0 == null || usd1 == null) { estimated = true; continue; }
+        usd += toHuman(Number(inc.amount0), pos.meta0.decimals) * usd0
+             + toHuman(Number(inc.amount1), pos.meta1.decimals) * usd1;
+      }
+      if (!(usd > 0)) return null;
+      let openTs = Number(incs[0].timestamp ?? 0) * 1000;
+      if (!openTs) { // event dari fallback chain tidak membawa timestamp
+        openTs = Number((await client.getBlock({
+          blockNumber: BigInt(incs[0].block_number),
+        })).timestamp) * 1000;
+      }
+      return {
+        initialUsd: usd, openTs,
+        source: estimated ? 'index-estimasi' : 'index',
+        lastAddBlock: Number(incs[incs.length - 1].block_number),
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  // Add liquidity SUSULAN (setelah sinceBlock) pada episode berjalan — nilainya
+  // ditambahkan ke modal awal yang sudah ada (termasuk modal manual)
+  private async entryAddsDelta(pos: any, wallet: string, sinceBlock: number, indexFresh: boolean):
+    Promise<{ usd: number; lastBlock: number; estimated: boolean } | null> {
+    if (pos.version === 'v4') {
+      const events = await this.saltEvents(pos.pool, BigInt(pos.tokenId));
+      const { open } = segmentEpisodes(events);
+      if (!open) return null;
+      const fresh = open.filter(
+        (e) => BigInt(e.liquidity_delta) > 0n && Number(e.block_number) > sinceBlock,
+      );
+      if (fresh.length === 0) return null;
+      const { usd, estimated } = await this.valueEvents(fresh, pos.pool, pos.meta0, pos.meta1, wallet);
+      if (!(usd > 0)) return null;
+      return { usd, lastBlock: Number(fresh[fresh.length - 1].block_number), estimated };
+    }
+    const rows = await this.v3Events(BigInt(pos.tokenId), indexFresh);
+    if (!rows || rows.length === 0) return null;
+    const { open } = segmentEpisodes(v3ToDeltas(rows));
+    if (!open) return null;
+    const fresh = (open as any[]).filter(
+      (e) => e.kind === 'increase' && Number(e.block_number) > sinceBlock,
+    );
+    if (fresh.length === 0) return null;
+    let usd = 0;
+    let estimated = false;
+    for (const inc of fresh) {
+      const { usd0, usd1, estimated: est } = await this.v3UsdAtBlock(pos, BigInt(inc.block_number));
+      if (est) estimated = true;
+      if (usd0 == null || usd1 == null) { estimated = true; continue; }
+      usd += toHuman(Number(inc.amount0), pos.meta0.decimals) * usd0
+           + toHuman(Number(inc.amount1), pos.meta1.decimals) * usd1;
+    }
+    if (!(usd > 0)) return null;
+    return { usd, lastBlock: Number(fresh[fresh.length - 1].block_number), estimated };
   }
 
   // Rekonstruksi penuh satu episode TERTUTUP -> entri journal
@@ -305,31 +395,48 @@ export class TrackingService {
     return events;
   }
 
+  // Semua event v3 sebuah tokenId: dari indeks saat segar, selain itu (atau
+  // saat indeks kosong untuk token ini) langsung dari chain
+  private async v3Events(tokenId: bigint, indexFresh: boolean): Promise<any[] | null> {
+    if (indexFresh) {
+      try {
+        const rows: any[] = await sql`
+          SELECT kind, liquidity, amount0, amount1, tx_hash, block_number, timestamp
+          FROM ponder.v3_position_event
+          WHERE token_id = ${tokenId.toString()}::numeric
+          ORDER BY block_number` as any;
+        if (rows.length > 0) return rows;
+      } catch { /* tabel belum ada — pakai fallback chain */ }
+    }
+    return this.v3EventsFromChain(tokenId);
+  }
+
+  // Harga USD kedua token pool v3 pada blok tertentu (fallback: harga sekarang)
+  private async v3UsdAtBlock(pos: any, blockNumber: bigint):
+    Promise<{ usd0: number | null; usd1: number | null; estimated: boolean }> {
+    try {
+      const slot0 = await client.readContract({
+        address: pos.pool as `0x${string}`, abi: v3PoolAbi, functionName: 'slot0', blockNumber,
+      });
+      const price = priceFromSqrt(sqrtPriceX96ToSqrtPrice(slot0[0]), pos.meta0.decimals, pos.meta1.decimals);
+      const eth = await ethUsd();
+      const { usd0, usd1 } = usdPerToken({ meta0: pos.meta0, meta1: pos.meta1, priceT1PerT0: price, eth });
+      const estimated = pos.meta0.native || pos.meta1.native ||
+        isSameAddr(pos.meta0.address, TOKENS.WETH) || isSameAddr(pos.meta1.address, TOKENS.WETH);
+      return { usd0, usd1, estimated };
+    } catch {
+      return { usd0: pos.usd0, usd1: pos.usd1, estimated: true };
+    }
+  }
+
   // Fee v3 yang sudah diklaim: collect() membayar tokensOwed = pokok hasil
   // decrease + fee. Porsi fee = collect − pokok decrease yang belum terbayar,
   // dinilai pada harga pool di blok klaim (fallback: harga sekarang).
   // Decrease yang belum di-collect membuat porsi fee tertahan sementara (≥0).
   private async v3CollectedDelta(pos: any, sinceBlock: number, indexFresh: boolean) {
-    let rows: any[] | null = null;
-    if (indexFresh) {
-      try {
-        rows = await sql`
-          SELECT kind, liquidity, amount0, amount1, tx_hash, block_number, timestamp
-          FROM ponder.v3_position_event
-          WHERE token_id = ${String(pos.tokenId)}::numeric
-          ORDER BY block_number` as any;
-      } catch { rows = null; } // tabel belum ada — pakai fallback chain
-    }
-    if (rows == null) rows = await this.v3EventsFromChain(BigInt(pos.tokenId));
+    const rows = await this.v3Events(BigInt(pos.tokenId), indexFresh);
     if (rows == null || rows.length === 0) return null;
-    const evs = rows.map((r: any) => ({
-      ...r,
-      liquidity_delta:
-        r.kind === 'increase' ? BigInt(r.liquidity)
-        : r.kind === 'decrease' ? -BigInt(r.liquidity)
-        : 0n,
-    }));
-    const { open } = segmentEpisodes(evs);
+    const { open } = segmentEpisodes(v3ToDeltas(rows));
     if (!open) return null;
     let pend0 = 0n, pend1 = 0n; // pokok decrease yang belum ditarik via collect
     const feeEvents: { block: number; fee0: bigint; fee1: bigint }[] = [];
@@ -351,16 +458,7 @@ export class TrackingService {
     if (fresh.length === 0) return null;
     let usd = 0;
     for (const fe of fresh) {
-      let usd0: number | null = pos.usd0, usd1: number | null = pos.usd1;
-      try {
-        const slot0 = await client.readContract({
-          address: pos.pool as `0x${string}`, abi: v3PoolAbi, functionName: 'slot0',
-          blockNumber: BigInt(fe.block),
-        });
-        const price = priceFromSqrt(sqrtPriceX96ToSqrtPrice(slot0[0]), pos.meta0.decimals, pos.meta1.decimals);
-        const eth = await ethUsd();
-        ({ usd0, usd1 } = usdPerToken({ meta0: pos.meta0, meta1: pos.meta1, priceT1PerT0: price, eth }));
-      } catch { /* archive call gagal — pakai harga sekarang */ }
+      const { usd0, usd1 } = await this.v3UsdAtBlock(pos, BigInt(fe.block));
       usd += toHuman(Number(fe.fee0), pos.meta0.decimals) * (usd0 ?? 0)
            + toHuman(Number(fe.fee1), pos.meta1.decimals) * (usd1 ?? 0);
     }
@@ -467,11 +565,13 @@ export class TrackingService {
     // parsial, episode lama yang belum lengkap bisa disangka episode berjalan
     // dan klaimnya salah menempel permanen ke posisi sekarang
     let indexFresh = false;
+    let headBlock = 0;
     try {
+      headBlock = Number(await client.getBlockNumber());
       const [{ synced }] = await sql`
         SELECT COALESCE(MAX(block_number), 0)::bigint AS synced FROM ponder.liquidity_event`;
-      indexFresh = (await client.getBlockNumber()) - BigInt(synced) < 5_000n;
-    } catch { /* indeks belum siap */ }
+      indexFresh = BigInt(headBlock) - BigInt(synced) < 5_000n;
+    } catch { /* indeks/RPC belum siap */ }
 
     const tracks = (await sql.unsafe(`SELECT * FROM "${schema}".position_track`))
       .map((t: any) => ({ ...t, data: parseData(t.data) }));
@@ -484,11 +584,13 @@ export class TrackingService {
       const upgradable = track &&
         (track.initial_source === 'first-seen' || track.initial_source?.endsWith('-estimasi'));
       if (upgradable) {
-        const entry = await this.reconstructEntry(pos, address);
+        const entry = await this.reconstructEntry(pos, address, indexFresh);
         if (entry && (entry.source === 'index' || track.initial_source === 'first-seen')) {
           track.initial_usd = entry.initialUsd;
           track.initial_source = entry.source;
           track.open_ts = new Date(entry.openTs);
+          track.data.entryLastBlock = entry.lastAddBlock;
+          track.data.trackedLiquidity = pos.liquidity;
           await sql.unsafe(
             `UPDATE "${schema}".position_track
              SET initial_usd = $2, initial_source = $3, open_ts = $4, updated_at = now()
@@ -499,13 +601,13 @@ export class TrackingService {
       }
 
       if (!track) {
-        const entry = await this.reconstructEntry(pos, address);
+        const entry = await this.reconstructEntry(pos, address, indexFresh);
         track = {
           key: pos.key,
           open_ts: new Date(entry?.openTs ?? Date.now()),
           initial_usd: entry?.initialUsd ?? pos.valueUsd,
           initial_source: entry?.source ?? 'first-seen',
-          data: {},
+          data: entry ? { entryLastBlock: entry.lastAddBlock, trackedLiquidity: pos.liquidity } : {},
         };
         await sql.unsafe(
           `INSERT INTO "${schema}".position_track (key, open_ts, initial_usd, initial_source, data)
@@ -513,6 +615,63 @@ export class TrackingService {
           [track.key, track.open_ts, track.initial_usd, track.initial_source],
         );
       }
+
+      // --- Modal awal mengikuti add liquidity susulan ---
+      // Tanpa ini, add ke posisi yang sama menaikkan nilai tapi modal diam,
+      // sehingga P&L melonjak palsu.
+      let entryLastBlock = Number(track.data?.entryLastBlock ?? 0);
+      let trackedLiquidity: string | undefined = track.data?.trackedLiquidity;
+      try {
+        const reconSource = track.initial_source === 'index' || track.initial_source === 'index-estimasi';
+        if (!entryLastBlock) {
+          // Migrasi track lama (belum punya penanda): sumber on-chain
+          // direkonstruksi penuh sekali supaya add yang telanjur terjadi ikut
+          // terhitung; sumber manual/first-seen dianggap mencakup kondisi kini
+          if (reconSource) {
+            const entry = await this.reconstructEntry(pos, address, indexFresh);
+            if (entry) {
+              track.initial_usd = entry.initialUsd;
+              track.initial_source = entry.source;
+              track.open_ts = new Date(entry.openTs);
+              entryLastBlock = entry.lastAddBlock;
+              trackedLiquidity = pos.liquidity;
+              await sql.unsafe(
+                `UPDATE "${schema}".position_track
+                 SET initial_usd = $2, initial_source = $3, open_ts = $4, updated_at = now()
+                 WHERE key = $1`,
+                [pos.key, entry.initialUsd, entry.source, new Date(entry.openTs)],
+              );
+            }
+          }
+          if (!entryLastBlock && !reconSource && headBlock > 0) {
+            entryLastBlock = headBlock;
+            trackedLiquidity = pos.liquidity;
+          }
+        } else if (trackedLiquidity != null && BigInt(pos.liquidity) > BigInt(trackedLiquidity)) {
+          // Liquidity on-chain naik = ada add baru → nilai add setelah
+          // entryLastBlock dan tambahkan ke modal (modal manual ikut bertambah,
+          // sumbernya tetap 'manual')
+          const delta = await this.entryAddsDelta(pos, address, entryLastBlock, indexFresh);
+          if (delta) {
+            track.initial_usd = Number(track.initial_usd) + delta.usd;
+            if (track.initial_source !== 'manual' && delta.estimated) {
+              track.initial_source = 'index-estimasi';
+            }
+            entryLastBlock = delta.lastBlock;
+            trackedLiquidity = pos.liquidity;
+            await sql.unsafe(
+              `UPDATE "${schema}".position_track
+               SET initial_usd = $2, initial_source = $3, updated_at = now()
+               WHERE key = $1`,
+              [pos.key, track.initial_usd, track.initial_source],
+            );
+          }
+          // delta null: event add belum terlihat indeks/logs — coba poll berikutnya
+        } else {
+          trackedLiquidity = pos.liquidity; // tetap/berkurang — modal tidak berubah
+        }
+      } catch { /* transien — dicoba lagi poll berikutnya */ }
+
       pos.initialUsd = Number(track.initial_usd);
       pos.initialSource = track.initial_source;
       pos.openTs = new Date(track.open_ts).getTime();
@@ -549,7 +708,8 @@ export class TrackingService {
         `UPDATE "${schema}".position_track SET data = $2, updated_at = now() WHERE key = $1`,
         [pos.key, JSON.stringify({
           pair: pos.pair, version: pos.version, valueUsd: pos.valueUsd, feesUsd: pos.feesUsd,
-          collectedFeesUsd: pos.collectedFeesUsd, collectLastBlock, pnlUsd: pos.pnlUsd, baselineVol24,
+          collectedFeesUsd: pos.collectedFeesUsd, collectLastBlock,
+          entryLastBlock, trackedLiquidity, pnlUsd: pos.pnlUsd, baselineVol24,
           rangeLower: pos.disp.lower, rangeUpper: pos.disp.upper, lastPrice: pos.disp.price,
           quote: pos.disp.quote, closeSide: pos.inRange ? 'in' : pos.outSide,
         })],
