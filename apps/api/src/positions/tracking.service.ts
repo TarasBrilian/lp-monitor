@@ -3,7 +3,7 @@ import { keccak256, encodeAbiParameters, pad, toHex } from 'viem';
 import { CONTRACTS, EXPLORER, TOKENS, tenantSchema } from '@lpmon/shared';
 import { sql } from '../db.js';
 import { client, isSameAddr } from '../chain/client.js';
-import { modifyLiquidityEvent, v3PoolAbi, v4StateViewAbi, v4PositionManagerAbi, POOL_KEY_ABI } from '../chain/abi.js';
+import { modifyLiquidityEvent, nfpmV3Events, v3PoolAbi, v4StateViewAbi, v4PositionManagerAbi, POOL_KEY_ABI } from '../chain/abi.js';
 import { tokenMeta, type TokenMeta } from '../chain/tokens.js';
 import { sqrtPriceX96ToSqrtPrice, priceFromSqrt, positionAmounts, toHuman } from '../chain/math.js';
 import { ethUsd, usdPerToken } from '../chain/prices.js';
@@ -262,20 +262,66 @@ export class TrackingService {
     return { usd, lastBlock: Number(batch[batch.length - 1].block_number) };
   }
 
+  // Fallback saat indeks belum segar: event v3 sebuah tokenId langsung dari
+  // chain via getLogs (jendela ~600 rb blok, potongan 150 rb), cache 10 menit.
+  // Posisi lebih tua dari jendela hanya kehilangan event awalnya — walk fee
+  // tetap konservatif karena pokok decrease dinetkan dari collect.
+  private v3LogsCache = new Map<string, { ts: number; events: any[] }>();
+  private async v3EventsFromChain(tokenId: bigint): Promise<any[] | null> {
+    const cacheKey = tokenId.toString();
+    const hit = this.v3LogsCache.get(cacheKey);
+    if (hit && Date.now() - hit.ts < 600_000) return hit.events;
+    const head = await client.getBlockNumber();
+    const CHUNK = 150_000n;
+    const start = head > 600_000n ? head - 600_000n : 0n;
+    const logs: any[] = [];
+    let ok = false;
+    for (const ev of nfpmV3Events) {
+      for (let from = start; from <= head; from += CHUNK) {
+        const to = from + CHUNK - 1n > head ? head : from + CHUNK - 1n;
+        try {
+          logs.push(...await client.getLogs({
+            address: CONTRACTS.v3PositionManager as `0x${string}`,
+            event: ev as any, args: { tokenId } as any,
+            fromBlock: from, toBlock: to,
+          }));
+          ok = true;
+        } catch { /* potongan gagal, lanjut */ }
+      }
+    }
+    if (!ok) return null; // semua potongan gagal — jangan cache, coba lagi nanti
+    const kindOf: Record<string, string> = {
+      IncreaseLiquidity: 'increase', DecreaseLiquidity: 'decrease', Collect: 'collect',
+    };
+    const events = logs
+      .map((l: any) => ({
+        kind: kindOf[l.eventName],
+        liquidity: l.args.liquidity ?? 0n,
+        amount0: l.args.amount0, amount1: l.args.amount1,
+        tx_hash: l.transactionHash, block_number: l.blockNumber, timestamp: 0,
+      }))
+      .sort((a, b) => Number(BigInt(a.block_number) - BigInt(b.block_number)));
+    this.v3LogsCache.set(cacheKey, { ts: Date.now(), events });
+    return events;
+  }
+
   // Fee v3 yang sudah diklaim: collect() membayar tokensOwed = pokok hasil
   // decrease + fee. Porsi fee = collect − pokok decrease yang belum terbayar,
   // dinilai pada harga pool di blok klaim (fallback: harga sekarang).
   // Decrease yang belum di-collect membuat porsi fee tertahan sementara (≥0).
-  private async v3CollectedDelta(pos: any, sinceBlock: number) {
-    let rows: any[];
-    try {
-      rows = await sql`
-        SELECT kind, liquidity, amount0, amount1, tx_hash, block_number, timestamp
-        FROM ponder.v3_position_event
-        WHERE token_id = ${String(pos.tokenId)}::numeric
-        ORDER BY block_number` as any;
-    } catch { return null; } // tabel belum ada — indexer belum upgrade/selesai sync
-    if (rows.length === 0) return null;
+  private async v3CollectedDelta(pos: any, sinceBlock: number, indexFresh: boolean) {
+    let rows: any[] | null = null;
+    if (indexFresh) {
+      try {
+        rows = await sql`
+          SELECT kind, liquidity, amount0, amount1, tx_hash, block_number, timestamp
+          FROM ponder.v3_position_event
+          WHERE token_id = ${String(pos.tokenId)}::numeric
+          ORDER BY block_number` as any;
+      } catch { rows = null; } // tabel belum ada — pakai fallback chain
+    }
+    if (rows == null) rows = await this.v3EventsFromChain(BigInt(pos.tokenId));
+    if (rows == null || rows.length === 0) return null;
     const evs = rows.map((r: any) => ({
       ...r,
       liquidity_delta:
@@ -475,17 +521,17 @@ export class TrackingService {
       // v3: event Collect), inkremental sejak blok terakhir yang sudah dinilai
       pos.collectedFeesUsd = Number(track.data?.collectedFeesUsd ?? 0);
       let collectLastBlock = Number(track.data?.collectLastBlock ?? 0);
-      if (indexFresh) {
-        try {
-          const claimed = pos.version === 'v4'
-            ? await this.v4CollectedDelta(pos, address, collectLastBlock)
-            : await this.v3CollectedDelta(pos, collectLastBlock);
-          if (claimed) {
-            pos.collectedFeesUsd += claimed.usd;
-            collectLastBlock = Math.max(collectLastBlock, claimed.lastBlock);
-          }
-        } catch { /* transien — dicoba lagi poll berikutnya */ }
-      }
+      try {
+        // v4 menunggu indeks segar (episode butuh riwayat lengkap); v3 punya
+        // fallback getLogs langsung ke chain sehingga jalan kapan pun
+        const claimed = pos.version === 'v4'
+          ? (indexFresh ? await this.v4CollectedDelta(pos, address, collectLastBlock) : null)
+          : await this.v3CollectedDelta(pos, collectLastBlock, indexFresh);
+        if (claimed) {
+          pos.collectedFeesUsd += claimed.usd;
+          collectLastBlock = Math.max(collectLastBlock, claimed.lastBlock);
+        }
+      } catch { /* transien — dicoba lagi poll berikutnya */ }
       pos.pnlUsd = pos.valueUsd + pos.feesUsd + pos.collectedFeesUsd - pos.initialUsd;
       pos.pnlPct = pos.initialUsd > 0 ? (pos.pnlUsd / pos.initialUsd) * 100 : null;
 

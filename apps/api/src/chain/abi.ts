@@ -32,6 +32,13 @@ export const v4StateViewAbi = parseAbi([
   'function getPositionInfo(bytes32 poolId, address owner, int24 tickLower, int24 tickUpper, bytes32 salt) view returns (uint128 liquidity, uint256 feeGrowthInside0LastX128, uint256 feeGrowthInside1LastX128)',
 ]);
 
+// Event NFPM v3 per tokenId (tokenId indexed — bisa difilter di getLogs)
+export const nfpmV3Events = parseAbi([
+  'event IncreaseLiquidity(uint256 indexed tokenId, uint128 liquidity, uint256 amount0, uint256 amount1)',
+  'event DecreaseLiquidity(uint256 indexed tokenId, uint128 liquidity, uint256 amount0, uint256 amount1)',
+  'event Collect(uint256 indexed tokenId, address recipient, uint256 amount0, uint256 amount1)',
+]);
+
 export const modifyLiquidityEvent = parseAbi([
   'event ModifyLiquidity(bytes32 indexed id, address indexed sender, int24 tickLower, int24 tickUpper, int256 liquidityDelta, bytes32 salt)',
 ])[0];
