@@ -60,7 +60,12 @@ satu pool koneksi, dan migrasi yang masih terkelola (loop semua schema `addr_%`)
 
 RPC: `https://rpc.mainnet.chain.robinhood.com` (rate-limited 429 — Ponder perlu
 konfigurasi polling konservatif; pertimbangkan RPC berbayar HANYA jika fee LP
-sudah membuktikan ROI).
+sudah membuktikan ROI). Sejak 31 Ags 2026 indexer kembali memakai RPC publik
+ini; `PONDER_RPC_URL` di `.env` produksi dinonaktifkan (saldo dRPC habis) dan
+tinggal diaktifkan lagi setelah top up.
+
+Blockscout (`api/v2/*`) berada di belakang Cloudflare: WAJIB lewat
+`apps/api/src/chain/blockscout.ts` yang memasang User-Agent browser.
 
 Token anchor: USDG `0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168` (6 des),
 WETH `0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73`.
@@ -99,9 +104,46 @@ Status per 28 Jul 2026:
    /api/* → VPS), backend di VPS 103.127.134.131 (API port 8790 via Bun+pm2,
    indexer Ponder port 42070 via Node 22/nvm+pm2, Postgres native lokal,
    pm2 startup systemd). Data journal termigrasi (pg_dump schema addr_*).
-   Indexer VPS backfill dalam dari blok 16 jt (START_BLOCK env).
    Belum: HTTPS/domain untuk jalur API, hardening akses server & database,
    rate limit API.
+
+   **Insiden 31 Ags 2026 — dua kegagalan yang menumpuk:**
+   1. Blockscout dipasangi proteksi bot Cloudflare; `fetch()` tanpa
+      User-Agent browser dibalas 403 (`cf-mitigated: challenge`, bukan 429 —
+      retry tidak menolong). Discovery posisi sengaja melempar error alih-alih
+      mengembalikan daftar kosong, sehingga muncul sebagai HTTP 500 di UI.
+      Diperbaiki: semua panggilan Blockscout lewat `chain/blockscout.ts`.
+      UA parsial tidak lolos — harus string browser utuh.
+   2. `PONDER_RPC_URL` (dRPC berbayar) kehabisan saldo → indexer crash-loop
+      3.878 kali sejak 30 Jul, indeks basi 28 jt blok. Ditangani dengan
+      kembali ke RPC publik + START_BLOCK dinaikkan ke **50.963.120** dan
+      schema `ponder` di-drop (Ponder menolak memakai ulang schema milik build
+      lain: `MigrationError: Schema "ponder" was previously used by a different
+      Ponder app`). Konsekuensi: riwayat indeks di bawah 50,96 jt hilang;
+      jurnal di schema `addr_*` tidak terpengaruh. Posisi lama tetap bisa
+      direkonstruksi karena `saltEvents` punya fallback `getLogs` 600 rb blok.
+      Backup sebelum drop: `~/lpmon-backup/` di VPS (ponder 142 MB gz +
+      tenants 38 KB), salinan tenant juga di `.backup-prod/` lokal.
+
+      **Percobaan pertama gagal dan ini penting untuk diketahui:** START_BLOCK
+      sempat diset 50.750.000 (200 rb blok backfill). Diukur dari
+      `ponder._ponder_checkpoint`, indexer hanya maju **18 detik waktu chain
+      per 55 detik waktu nyata** (±3,2 blok/dtk, sementara chain menghasilkan
+      ±10 blok/dtk) — makin tertinggal, bukan mengejar. Di RPC publik, backfill
+      apa pun yang berarti tidak akan pernah selesai.
+
+      **Keadaan sekarang belum stabil.** Setelah START_BLOCK didekatkan ke
+      ujung chain, ketertinggalan turun dari 5,81 jam ke 3,5 menit
+      (`indexFresh` sempat true), tapi terus melebar: 213s → 285s → 319s dalam
+      pemantauan singkat. Diperkirakan menembus ambang 5.000 blok lagi.
+      Kesimpulan terukur: RPC publik tidak sanggup menahan indexer di ujung
+      chain. Jalan keluar: isi ulang dRPC (aktifkan lagi `PONDER_RPC_URL`),
+      atau setel `maxRequestsPerSecond`/`ethGetLogsBlockRange` Ponder supaya
+      tidak boros retry akibat 429.
+
+   Pelajaran operasional: sumber data eksternal gratis bisa berubah kebijakan
+   tanpa peringatan, dan RPC berbayar bisa habis diam-diam. Keduanya hanya
+   terlihat lewat `pm2 list` (restart count) dan log — belum ada alerting.
 
 ## Konvensi
 
