@@ -8,6 +8,7 @@ import { tokenMeta, type TokenMeta } from '../chain/tokens.js';
 import { sqrtPriceX96ToSqrtPrice, priceFromSqrt, positionAmounts, toHuman } from '../chain/math.js';
 import { ethUsd, usdPerToken } from '../chain/prices.js';
 import { poolStats } from '../chain/volume.js';
+import { blockscoutFetch } from '../chain/blockscout.js';
 import { v3Liquidity, v4Liquidity } from '../chain/positions.js';
 
 type LiqEvent = {
@@ -61,9 +62,7 @@ export class TrackingService {
   // Aliran token dari/ke wallet dalam satu tx (untuk nilai deposit/penarikan asli)
   private async walletFlows(txHash: string, wallet: string): Promise<Map<string, number>> {
     const flows = new Map<string, number>();
-    const res = await fetch(`${EXPLORER}/api/v2/transactions/${txHash}/token-transfers?type=ERC-20`, {
-      headers: { accept: 'application/json' }, signal: AbortSignal.timeout(15_000),
-    });
+    const res = await blockscoutFetch(`${EXPLORER}/api/v2/transactions/${txHash}/token-transfers?type=ERC-20`);
     if (!res.ok) throw new Error(`blockscout ${res.status}`);
     const json: any = await res.json();
     const w = wallet.toLowerCase();

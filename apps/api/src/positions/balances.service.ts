@@ -2,6 +2,7 @@ import { Injectable } from '@nestjs/common';
 import { EXPLORER, TOKENS } from '@lpmon/shared';
 import { client, isSameAddr } from '../chain/client.js';
 import { ethUsd } from '../chain/prices.js';
+import { blockscoutFetch } from '../chain/blockscout.js';
 
 const priceCache = new Map<string, { price: number | null; ts: number }>();
 
@@ -57,7 +58,7 @@ export class BalancesService {
       let url = `${EXPLORER}/api/v2/addresses/${address}/tokens?type=ERC-20`;
       const items: any[] = [];
       for (let page = 0; page < 5 && url; page++) {
-        const res = await fetch(url, { headers: { accept: 'application/json' }, signal: AbortSignal.timeout(15_000) });
+        const res = await blockscoutFetch(url);
         if (!res.ok) break;
         const json: any = await res.json();
         items.push(...(json.items ?? []));

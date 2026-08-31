@@ -2,6 +2,7 @@ import { Injectable } from '@nestjs/common';
 import { CONTRACTS, EXPLORER } from '@lpmon/shared';
 import { sql } from '../db.js';
 import { client } from '../chain/client.js';
+import { blockscoutFetch } from '../chain/blockscout.js';
 import { ethUsd } from '../chain/prices.js';
 import { readV3Position, readV4Position, v4Liquidity, displayFields } from '../chain/positions.js';
 import { TrackingService } from './tracking.service.js';
@@ -55,7 +56,7 @@ export class PositionsService {
     const found: Discovered = { v3: [], v4: [], source: 'blockscout' };
     let url = `${EXPLORER}/api/v2/addresses/${address}/nft?type=ERC-721`;
     for (let page = 0; page < 10 && url; page++) {
-      const res = await fetch(url, { headers: { accept: 'application/json' }, signal: AbortSignal.timeout(15_000) });
+      const res = await blockscoutFetch(url);
       // Kegagalan harus jadi error, bukan hasil kosong — hasil kosong palsu
       // akan membuat semua posisi dianggap "ditutup"
       if (!res.ok) throw new Error(`Blockscout ${res.status} saat discovery`);
