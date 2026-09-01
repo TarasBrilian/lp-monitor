@@ -1,16 +1,21 @@
 import { Injectable } from '@nestjs/common';
 import { CONTRACTS, EXPLORER } from '@lpmon/shared';
 import { sql } from '../db.js';
-import { client } from '../chain/client.js';
+import { client, isSameAddr } from '../chain/client.js';
 import { blockscoutFetch } from '../chain/blockscout.js';
 import { ethUsd } from '../chain/prices.js';
 import { readV3Position, readV4Position, v4Liquidity, displayFields } from '../chain/positions.js';
+import { erc721TransferEvent, v3PositionManagerAbi, v4PositionManagerAbi } from '../chain/abi.js';
 import { TrackingService } from './tracking.service.js';
 
-type Discovered = { v3: bigint[]; v4: bigint[]; source: 'index' | 'blockscout' };
+type Discovered = { v3: bigint[]; v4: bigint[]; source: string };
 
 const EMPTY_RECHECK_MS = 6 * 3_600_000;
 const LIST_CACHE_MS = 30_000;
+// Jendela pindaian awal jaring pengaman (~14 jam pada ~10 blok/detik) — cukup
+// menutup ketertinggalan Blockscout maupun indeks. Setelahnya inkremental.
+const SAFETY_LOOKBACK = 500_000n;
+const SAFETY_CHUNK = 50_000n;
 
 @Injectable()
 export class PositionsService {
@@ -25,7 +30,7 @@ export class PositionsService {
 
   // Discovery utama dari indeks Ponder; fallback ke Blockscout selama backfill
   // indeks belum mengejar ujung chain.
-  private async discover(address: string): Promise<Discovered> {
+  private async discoverPrimary(address: string): Promise<Discovered> {
     try {
       const [{ synced }] = await sql`
         SELECT COALESCE(MAX(block_number), 0)::bigint AS synced FROM ponder.position_transfer`;
@@ -73,6 +78,88 @@ export class PositionsService {
           new URLSearchParams(Object.entries(next).map(([k, v]) => [k, String(v)])).toString()
         : '';
     }
+    return found;
+  }
+
+  // Kedua sumber utama bisa tertinggal berjam-jam: indeks kepemilikan NFT
+  // Blockscout maupun indeks Ponder saat RPC lambat. Posisi yang baru dibuka
+  // lalu tidak terlihat sama sekali. Jaring pengaman: pindai event Transfer
+  // ke address ini langsung dari chain, inkremental sejak blok terakhir yang
+  // sudah dipindai.
+  //
+  // HANYA MENAMBAH kandidat, tidak pernah menggantikan sumber utama — pindaian
+  // ini cuma mencakup blok belakangan, jadi kalau dipakai sendirian posisi lama
+  // akan tampak hilang dan ikut terjurnal sebagai "ditutup".
+  private safetyScan = new Map<string, { lastBlock: bigint; v3: Set<string>; v4: Set<string> }>();
+
+  private async discoverOnchain(address: string): Promise<{ v3: bigint[]; v4: bigint[] }> {
+    const key = address.toLowerCase();
+    const head = await client.getBlockNumber();
+    const prev = this.safetyScan.get(key);
+    const state = prev ?? { lastBlock: 0n, v3: new Set<string>(), v4: new Set<string>() };
+    const from = prev ? prev.lastBlock + 1n : head > SAFETY_LOOKBACK ? head - SAFETY_LOOKBACK : 0n;
+
+    let complete = true;
+    for (const [version, contract] of [
+      ['v3', CONTRACTS.v3PositionManager],
+      ['v4', CONTRACTS.v4PositionManager],
+    ] as const) {
+      for (let f = from; f <= head; f += SAFETY_CHUNK) {
+        const t = f + SAFETY_CHUNK - 1n > head ? head : f + SAFETY_CHUNK - 1n;
+        try {
+          const logs = await client.getLogs({
+            address: contract as `0x${string}`,
+            event: erc721TransferEvent,
+            args: { to: address as `0x${string}` },
+            fromBlock: f,
+            toBlock: t,
+          });
+          for (const l of logs) state[version].add(String(l.args.tokenId));
+        } catch {
+          complete = false; // potongan gagal — jangan majukan penanda, coba lagi nanti
+        }
+      }
+    }
+    // Penanda hanya maju kalau seluruh rentang berhasil dipindai, supaya tidak
+    // ada blok yang terlewat diam-diam
+    if (complete) state.lastBlock = head;
+    this.safetyScan.set(key, state);
+    return { v3: [...state.v3].map(BigInt), v4: [...state.v4].map(BigInt) };
+  }
+
+  // NFT yang pernah masuk ke address bisa sudah dipindahtangankan — pemilik
+  // sekarang harus diverifikasi sebelum posisinya ikut ditampilkan
+  private async ownedNow(address: string, v3: bigint[], v4: bigint[]) {
+    const keep = async (ids: bigint[], contract: string, abi: typeof v3PositionManagerAbi | typeof v4PositionManagerAbi) => {
+      const res = await Promise.allSettled(ids.map((id) =>
+        client.readContract({ address: contract as `0x${string}`, abi: abi as any, functionName: 'ownerOf', args: [id] })));
+      return ids.filter((_, i) => {
+        const r = res[i];
+        return r.status === 'fulfilled' && isSameAddr(r.value as string, address);
+      });
+    };
+    const [k3, k4] = await Promise.all([
+      keep(v3, CONTRACTS.v3PositionManager, v3PositionManagerAbi),
+      keep(v4, CONTRACTS.v4PositionManager, v4PositionManagerAbi),
+    ]);
+    return { v3: k3, v4: k4 };
+  }
+
+  private async discover(address: string): Promise<Discovered> {
+    const found = await this.discoverPrimary(address);
+    try {
+      const extra = await this.discoverOnchain(address);
+      const seen3 = new Set(found.v3.map(String));
+      const seen4 = new Set(found.v4.map(String));
+      const cand3 = extra.v3.filter((id) => !seen3.has(String(id)));
+      const cand4 = extra.v4.filter((id) => !seen4.has(String(id)));
+      if (cand3.length || cand4.length) {
+        const owned = await this.ownedNow(address, cand3, cand4);
+        found.v3.push(...owned.v3);
+        found.v4.push(...owned.v4);
+        if (owned.v3.length || owned.v4.length) found.source += '+onchain';
+      }
+    } catch { /* jaring pengaman bersifat best-effort — sumber utama tetap dipakai */ }
     return found;
   }
 

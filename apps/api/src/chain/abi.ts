@@ -39,6 +39,12 @@ export const nfpmV3Events = parseAbi([
   'event Collect(uint256 indexed tokenId, address recipient, uint256 amount0, uint256 amount1)',
 ]);
 
+// Transfer ERC-721 dengan `to` indexed — dipakai discovery jaring pengaman
+// untuk menemukan NFT posisi langsung dari chain
+export const erc721TransferEvent = parseAbi([
+  'event Transfer(address indexed from, address indexed to, uint256 indexed tokenId)',
+])[0];
+
 export const modifyLiquidityEvent = parseAbi([
   'event ModifyLiquidity(bytes32 indexed id, address indexed sender, int24 tickLower, int24 tickUpper, int256 liquidityDelta, bytes32 salt)',
 ])[0];
